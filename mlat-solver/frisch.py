@@ -93,7 +93,7 @@ def solve_toa(
     Uses scipy.optimize.least_squares with:
       - Trust Region Reflective (trf) method
       - Huber loss for outlier robustness (Part 21, Approach 1)
-      - f_scale=1.0 (transition between quadratic and linear loss at 1m)
+      - f_scale=100.0 (Huber transition at 100m residual)
 
     Args:
         sensors: Sensor positions, shape (N, 3) in ECEF meters.
