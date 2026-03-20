@@ -106,3 +106,61 @@ One JSON object per line (JSONL):
 | `timestamp_ns` | int | Reception time (nanosecond component) |
 
 Logs and statistics are written to stderr every 30 seconds.
+
+## Layer 3: Correlation Engine
+
+Groups decoded Mode-S messages from multiple sensors that received the **same transmission** from the **same aircraft** at nearly the **same time**. Uses Python dicts with time-windowed correlation.
+
+### How It Works
+
+1. Messages are keyed by `(ICAO, raw_msg)` — same aircraft, same radio frame
+2. Receptions arriving within a configurable time window (default 2ms) are grouped together
+3. Groups are emitted when the window expires
+4. Groups below the minimum reception count are dropped
+
+**Time window rationale:** Airsquitter sensors have 30ns GPS sync. Max propagation delay across a 50km baseline ≈ 167µs. The default 2ms window provides comfortable margin.
+
+### Configuration
+
+Environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MLAT_WINDOW_MS` | `2.0` | Correlation window in milliseconds |
+| `MLAT_MIN_RECEPTIONS` | `2` | Minimum sensors per group (2 enables semi-MLAT) |
+
+### Run
+
+Full pipeline (Layer 1 → 2 → 3):
+
+```bash
+./data-pipe/mlat-pipe | python3 modes-decoder/main.py | python3 correlation-engine/main.py
+```
+
+Or replay from saved Layer 2 output:
+
+```bash
+cat decoded_data.jsonl | python3 correlation-engine/main.py
+```
+
+### Output Format
+
+One JSON object per line (JSONL):
+
+```json
+{"icao":"4CA7E8","df_type":4,"altitude_ft":36000,"squawk":null,"raw_msg":"2000171806A983","num_sensors":3,"receptions":[{"sensor_id":1001,"lat":50.1,"lon":-5.7,"alt":100.0,"timestamp_s":43200,"timestamp_ns":500000000},{"sensor_id":1002,"lat":50.2,"lon":-5.6,"alt":105.0,"timestamp_s":43200,"timestamp_ns":500000050},{"sensor_id":1003,"lat":50.3,"lon":-5.5,"alt":110.0,"timestamp_s":43200,"timestamp_ns":500000100}]}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `icao` | string | 6-char hex ICAO aircraft address |
+| `df_type` | int | Downlink Format number |
+| `altitude_ft` | int\|null | Barometric altitude in feet |
+| `squawk` | string\|null | 4-digit squawk code |
+| `raw_msg` | string | Original hex message |
+| `num_sensors` | int | Number of sensors in this group |
+| `receptions` | array | List of per-sensor receptions |
+
+Each reception contains: `sensor_id`, `lat`, `lon`, `alt`, `timestamp_s`, `timestamp_ns`.
+
+Logs and statistics are written to stderr every 30 seconds.
