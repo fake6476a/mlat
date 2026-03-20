@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MLAT Live Map — Aircraft Multilateration</title>
+
+    <!-- MapLibre GL JS v5.20.2 (BSD-3-Clause) -->
+    <link href="https://unpkg.com/maplibre-gl@5.20.2/dist/maplibre-gl.css" rel="stylesheet" />
+    <script src="https://unpkg.com/maplibre-gl@5.20.2/dist/maplibre-gl.js"></script>
+
+    <!-- Deck.gl v9.2.11 (MIT) — standalone bundle -->
+    <script src="https://unpkg.com/deck.gl@9.2.11/dist.min.js"></script>
+
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0a0a1a;
+            color: #e0e0e0;
+            overflow: hidden;
+        }
+
+        #map { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+
+        /* Status panel (top-left) */
+        .status-panel {
+            position: absolute;
+            top: 12px;
+            left: 12px;
+            background: rgba(10, 10, 26, 0.92);
+            border: 1px solid rgba(0, 180, 255, 0.3);
+            border-radius: 8px;
+            padding: 12px 16px;
+            min-width: 220px;
+            z-index: 10;
+            backdrop-filter: blur(8px);
+        }
+
+        .status-panel h1 {
+            font-size: 14px;
+            font-weight: 700;
+            color: #00b4ff;
+            margin-bottom: 8px;
+            letter-spacing: 0.5px;
+        }
+
+        .status-row {
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+            padding: 2px 0;
+        }
+
+        .status-label { color: #8899aa; }
+        .status-value { color: #e0e0e0; font-weight: 600; }
+
+        .ws-status {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 6px;
+            vertical-align: middle;
+        }
+
+        .ws-connected { background: #00ff88; box-shadow: 0 0 6px #00ff88; }
+        .ws-disconnected { background: #ff4444; box-shadow: 0 0 6px #ff4444; }
+        .ws-connecting { background: #ffaa00; box-shadow: 0 0 6px #ffaa00; }
+
+        /* Aircraft info tooltip */
+        .aircraft-tooltip {
+            position: absolute;
+            background: rgba(10, 10, 26, 0.95);
+            border: 1px solid rgba(0, 180, 255, 0.4);
+            border-radius: 6px;
+            padding: 10px 14px;
+            font-size: 12px;
+            pointer-events: none;
+            z-index: 20;
+            min-width: 180px;
+            backdrop-filter: blur(8px);
+            display: none;
+        }
+
+        .aircraft-tooltip .tt-icao {
+            font-size: 14px;
+            font-weight: 700;
+            color: #00b4ff;
+            margin-bottom: 4px;
+        }
+
+        .aircraft-tooltip .tt-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 1px 0;
+        }
+
+        .aircraft-tooltip .tt-label { color: #8899aa; }
+        .aircraft-tooltip .tt-value { color: #e0e0e0; font-weight: 600; }
+
+        /* Legend */
+        .legend-panel {
+            position: absolute;
+            bottom: 32px;
+            left: 12px;
+            background: rgba(10, 10, 26, 0.92);
+            border: 1px solid rgba(0, 180, 255, 0.3);
+            border-radius: 8px;
+            padding: 10px 14px;
+            z-index: 10;
+            backdrop-filter: blur(8px);
+            font-size: 11px;
+        }
+
+        .legend-panel h3 {
+            font-size: 11px;
+            color: #00b4ff;
+            margin-bottom: 6px;
+            font-weight: 600;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 2px 0;
+        }
+
+        .legend-color {
+            width: 12px;
+            height: 12px;
+            border-radius: 2px;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+
+    <!-- Status panel -->
+    <div class="status-panel">
+        <h1>MLAT LIVE MAP</h1>
+        <div class="status-row">
+            <span class="status-label">
+                <span class="ws-status ws-connecting" id="ws-indicator"></span>
+                WebSocket
+            </span>
+            <span class="status-value" id="ws-state">Connecting…</span>
+        </div>
+        <div class="status-row">
+            <span class="status-label">Aircraft</span>
+            <span class="status-value" id="aircraft-count">0</span>
+        </div>
+        <div class="status-row">
+            <span class="status-label">Updates</span>
+            <span class="status-value" id="update-count">0</span>
+        </div>
+        <div class="status-row">
+            <span class="status-label">Last Update</span>
+            <span class="status-value" id="last-update">—</span>
+        </div>
+    </div>
+
+    <!-- Aircraft tooltip -->
+    <div class="aircraft-tooltip" id="tooltip">
+        <div class="tt-icao" id="tt-icao"></div>
+        <div class="tt-row"><span class="tt-label">Altitude</span><span class="tt-value" id="tt-alt"></span></div>
+        <div class="tt-row"><span class="tt-label">Speed</span><span class="tt-value" id="tt-speed"></span></div>
+        <div class="tt-row"><span class="tt-label">Heading</span><span class="tt-value" id="tt-heading"></span></div>
+        <div class="tt-row"><span class="tt-label">V/Rate</span><span class="tt-value" id="tt-vrate"></span></div>
+        <div class="tt-row"><span class="tt-label">Sensors</span><span class="tt-value" id="tt-sensors"></span></div>
+        <div class="tt-row"><span class="tt-label">GDOP</span><span class="tt-value" id="tt-gdop"></span></div>
+        <div class="tt-row"><span class="tt-label">Residual</span><span class="tt-value" id="tt-residual"></span></div>
+        <div class="tt-row"><span class="tt-label">Quality</span><span class="tt-value" id="tt-quality"></span></div>
+        <div class="tt-row"><span class="tt-label">Method</span><span class="tt-value" id="tt-method"></span></div>
+    </div>
+
+    <!-- Altitude legend -->
+    <div class="legend-panel">
+        <h3>ALTITUDE (ft)</h3>
+        <div class="legend-item"><div class="legend-color" style="background:#00ff88"></div> &lt; 10,000</div>
+        <div class="legend-item"><div class="legend-color" style="background:#00ccff"></div> 10,000–25,000</div>
+        <div class="legend-item"><div class="legend-color" style="background:#aa66ff"></div> 25,000–35,000</div>
+        <div class="legend-item"><div class="legend-color" style="background:#ff6644"></div> &gt; 35,000</div>
+    </div>
+
+    <script>
+    // ── Configuration ──────────────────────────────────────────────
+    const WS_URL = `ws://${window.location.host}/ws`;
+    const CORNWALL_CENTER = [-5.05, 50.27];  // Cornwall, UK
+    const INITIAL_ZOOM = 8;
+
+    // ── State ──────────────────────────────────────────────────────
+    let aircraftData = [];
+    let trailData = [];
+    let updateCount = 0;
+    let ws = null;
+    let reconnectTimer = null;
+
+    // ── Color by altitude ──────────────────────────────────────────
+    function altitudeColor(altFt) {
+        if (altFt == null) return [128, 128, 128, 220];
+        if (altFt < 10000)  return [0, 255, 136, 220];   // green
+        if (altFt < 25000)  return [0, 204, 255, 220];   // cyan
+        if (altFt < 35000)  return [170, 102, 255, 220]; // purple
+        return [255, 102, 68, 220];                       // orange
+    }
+
+    // ── MapLibre GL JS initialization ──────────────────────────────
+    const map = new maplibregl.Map({
+        container: 'map',
+        style: {
+            version: 8,
+            name: 'MLAT Dark',
+            sources: {
+                'osm-tiles': {
+                    type: 'raster',
+                    tiles: [
+                        'https://tile.openstreetmap.org/{z}/{x}/{y}.png'
+                    ],
+                    tileSize: 256,
+                    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+                }
+            },
+            layers: [
+                {
+                    id: 'osm-layer',
+                    type: 'raster',
+                    source: 'osm-tiles',
+                    paint: {
+                        'raster-saturation': -0.8,
+                        'raster-brightness-max': 0.4,
+                        'raster-contrast': 0.3
+                    }
+                }
+            ]
+        },
+        center: CORNWALL_CENTER,
+        zoom: INITIAL_ZOOM,
+        pitch: 0,
+        bearing: 0
+    });
+
+    map.addControl(new maplibregl.NavigationControl(), 'top-right');
+    map.addControl(new maplibregl.ScaleControl({ maxWidth: 200 }), 'bottom-right');
+
+    // ── Deck.gl overlay ────────────────────────────────────────────
+    let deckOverlay = null;
+
+    function createDeckOverlay() {
+        deckOverlay = new deck.MapboxOverlay({
+            interleaved: false,
+            layers: buildLayers()
+        });
+        map.addControl(deckOverlay);
+    }
+
+    function buildLayers() {
+        const layers = [];
+
+        // Trail layer — PathLayer for flight trails
+        if (trailData.length > 0) {
+            layers.push(new deck.PathLayer({
+                id: 'trails',
+                data: trailData,
+                getPath: d => d.path,
+                getColor: d => {
+                    const c = altitudeColor(d.alt_ft);
+                    return [c[0], c[1], c[2], 80]; // semi-transparent
+                },
+                getWidth: 2,
+                widthMinPixels: 1,
+                widthMaxPixels: 3,
+                capRounded: true,
+                jointRounded: true,
+                pickable: false,
+            }));
+        }
+
+        // Aircraft icon layer — ScatterplotLayer for aircraft positions
+        if (aircraftData.length > 0) {
+            layers.push(new deck.ScatterplotLayer({
+                id: 'aircraft',
+                data: aircraftData,
+                getPosition: d => [d.lon, d.lat],
+                getRadius: 6,
+                radiusMinPixels: 4,
+                radiusMaxPixels: 12,
+                getFillColor: d => altitudeColor(d.alt_ft),
+                getLineColor: [255, 255, 255, 180],
+                lineWidthMinPixels: 1,
+                stroked: true,
+                pickable: true,
+                autoHighlight: true,
+                highlightColor: [255, 255, 255, 100],
+            }));
+
+            // Text labels for ICAO addresses
+            layers.push(new deck.TextLayer({
+                id: 'labels',
+                data: aircraftData,
+                getPosition: d => [d.lon, d.lat],
+                getText: d => d.icao,
+                getSize: 11,
+                getColor: [255, 255, 255, 200],
+                getAngle: 0,
+                getTextAnchor: 'start',
+                getAlignmentBaseline: 'bottom',
+                getPixelOffset: [10, -10],
+                fontFamily: 'monospace',
+                fontWeight: 700,
+                pickable: false,
+            }));
+        }
+
+        // Sensor positions — fixed markers for the 9 Cornwall sensors
+        const sensorLayer = new deck.ScatterplotLayer({
+            id: 'sensors',
+            data: [
+                // Approximate Cornwall sensor positions (from reference doc)
+                { lon: -5.7, lat: 50.1, name: 'Sensor 1' },
+                { lon: -5.6, lat: 50.2, name: 'Sensor 2' },
+                { lon: -5.5, lat: 50.3, name: 'Sensor 3' },
+                { lon: -5.4, lat: 50.15, name: 'Sensor 4' },
+                { lon: -5.3, lat: 50.25, name: 'Sensor 5' },
+                { lon: -5.1, lat: 50.35, name: 'Sensor 6' },
+                { lon: -5.0, lat: 50.1, name: 'Sensor 7' },
+                { lon: -6.3, lat: 49.92, name: 'Sensor 8' },
+                { lon: -6.35, lat: 49.95, name: 'Sensor 9' },
+            ],
+            getPosition: d => [d.lon, d.lat],
+            getRadius: 5,
+            radiusMinPixels: 3,
+            radiusMaxPixels: 8,
+            getFillColor: [255, 200, 0, 200],
+            getLineColor: [255, 255, 255, 200],
+            lineWidthMinPixels: 1,
+            stroked: true,
+            pickable: false,
+        });
+        layers.push(sensorLayer);
+
+        return layers;
+    }
+
+    // ── Tooltip handling ───────────────────────────────────────────
+    const tooltip = document.getElementById('tooltip');
+
+    function showTooltip(info) {
+        if (!info || !info.object) {
+            tooltip.style.display = 'none';
+            return;
+        }
+
+        const d = info.object;
+        document.getElementById('tt-icao').textContent = d.icao || '—';
+        document.getElementById('tt-alt').textContent = d.alt_ft != null ? `${Math.round(d.alt_ft).toLocaleString()} ft` : '—';
+        document.getElementById('tt-speed').textContent = d.speed_kts != null ? `${Math.round(d.speed_kts)} kts` : '—';
+        document.getElementById('tt-heading').textContent = d.heading_deg != null ? `${Math.round(d.heading_deg)}°` : '—';
+        document.getElementById('tt-vrate').textContent = d.vrate_fpm != null ? `${Math.round(d.vrate_fpm)} fpm` : '—';
+        document.getElementById('tt-sensors').textContent = d.num_sensors || '—';
+        document.getElementById('tt-gdop').textContent = d.gdop != null ? d.gdop.toFixed(1) : '—';
+        document.getElementById('tt-residual').textContent = d.residual_m != null ? `${d.residual_m.toFixed(0)} m` : '—';
+        document.getElementById('tt-quality').textContent = d.track_quality || '—';
+        document.getElementById('tt-method').textContent = d.solve_method || '—';
+
+        tooltip.style.display = 'block';
+        tooltip.style.left = (info.x + 12) + 'px';
+        tooltip.style.top = (info.y + 12) + 'px';
+    }
+
+    // ── WebSocket connection ───────────────────────────────────────
+    function connectWebSocket() {
+        setWsStatus('connecting');
+
+        ws = new WebSocket(WS_URL);
+
+        ws.onopen = () => {
+            setWsStatus('connected');
+            if (reconnectTimer) {
+                clearTimeout(reconnectTimer);
+                reconnectTimer = null;
+            }
+        };
+
+        ws.onmessage = (event) => {
+            try {
+                const msg = JSON.parse(event.data);
+                if (msg.type === 'update') {
+                    handleUpdate(msg);
+                }
+            } catch (e) {
+                console.error('Parse error:', e);
+            }
+        };
+
+        ws.onclose = () => {
+            setWsStatus('disconnected');
+            scheduleReconnect();
+        };
+
+        ws.onerror = () => {
+            setWsStatus('disconnected');
+        };
+    }
+
+    function scheduleReconnect() {
+        if (!reconnectTimer) {
+            reconnectTimer = setTimeout(() => {
+                reconnectTimer = null;
+                connectWebSocket();
+            }, 3000);
+        }
+    }
+
+    function setWsStatus(state) {
+        const indicator = document.getElementById('ws-indicator');
+        const label = document.getElementById('ws-state');
+
+        indicator.className = 'ws-status';
+        switch (state) {
+            case 'connected':
+                indicator.classList.add('ws-connected');
+                label.textContent = 'Connected';
+                break;
+            case 'disconnected':
+                indicator.classList.add('ws-disconnected');
+                label.textContent = 'Disconnected';
+                break;
+            case 'connecting':
+                indicator.classList.add('ws-connecting');
+                label.textContent = 'Connecting…';
+                break;
+        }
+    }
+
+    // ── Handle data updates ────────────────────────────────────────
+    function handleUpdate(msg) {
+        updateCount++;
+        const aircraft = msg.aircraft || [];
+
+        // Update aircraft positions
+        aircraftData = aircraft.map(ac => ({
+            icao: ac.icao,
+            lat: ac.lat,
+            lon: ac.lon,
+            alt_ft: ac.alt_ft,
+            heading_deg: ac.heading_deg,
+            speed_kts: ac.speed_kts,
+            vrate_fpm: ac.vrate_fpm,
+            track_quality: ac.track_quality,
+            num_sensors: ac.num_sensors,
+            gdop: ac.gdop,
+            residual_m: ac.residual_m,
+            solve_method: ac.solve_method,
+        }));
+
+        // Update trail data
+        trailData = aircraft
+            .filter(ac => ac.trail && ac.trail.length >= 2)
+            .map(ac => ({
+                icao: ac.icao,
+                alt_ft: ac.alt_ft,
+                path: ac.trail,
+            }));
+
+        // Update UI stats
+        document.getElementById('aircraft-count').textContent = aircraft.length;
+        document.getElementById('update-count').textContent = updateCount;
+        document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+
+        // Refresh Deck.gl layers
+        if (deckOverlay) {
+            deckOverlay.setProps({
+                layers: buildLayers(),
+                getTooltip: null,
+                onHover: showTooltip,
+            });
+        }
+    }
+
+    // ── Initialize ─────────────────────────────────────────────────
+    map.on('load', () => {
+        createDeckOverlay();
+        connectWebSocket();
+    });
+    </script>
+</body>
+</html>

@@ -257,3 +257,185 @@ Logs and statistics are written to stderr every 30 seconds.
 | `frisch.py` | Frisch TOA iterative refinement | Part 18, Part 22 |
 | `solver.py` | Full pipeline routing + validation | Part 20 |
 | `main.py` | stdin/stdout JSONL entry point | — |
+
+## Layer 5: Track Builder
+
+Filters and smooths MLAT position fixes into continuous aircraft tracks using a custom Extended Kalman Filter (EKF). Associates incoming fixes by ICAO address and maintains per-aircraft track state with position history and derived kinematics.
+
+### Extended Kalman Filter (Part 22)
+
+- **State vector:** `[x, y, z, vx, vy, vz]` — position + velocity in ECEF meters
+- **Motion model:** Constant-velocity with process noise acceleration σ = 5.0 m/s²
+- **Measurement model:** Direct position observation with σ = 200 m per axis
+- **Innovation gating:** Mahalanobis distance check — rejects fixes with χ²₃ > 14.16 (99.7% confidence, 3-DOF)
+- **Max prediction gap:** 60 seconds — track is reset if gap exceeds this
+
+### Track Lifecycle
+
+1. **Create:** New track initialized on first fix for an ICAO address
+2. **Update:** Subsequent fixes run EKF predict → gate → update cycle
+3. **Establish:** Track considered reliable after ≥ 2 accepted updates
+4. **Prune:** Tracks with no updates for > 300 seconds are removed
+
+### Derived Quantities
+
+Computed from the EKF velocity state at each update:
+
+| Quantity | Unit | Description |
+|----------|------|-------------|
+| `heading_deg` | degrees | Ground track heading (0° = North, clockwise) |
+| `speed_kts` | knots | Ground speed |
+| `vrate_fpm` | ft/min | Vertical rate |
+
+### Install
+
+```bash
+pip install -r track-builder/requirements.txt
+```
+
+### Run
+
+Full pipeline (Layer 1 → 2 → 3 → 4 → 5):
+
+```bash
+./data-pipe/mlat-pipe | python3 modes-decoder/main.py | python3 correlation-engine/main.py | python3 mlat-solver/main.py | python3 track-builder/main.py
+```
+
+Or replay from saved Layer 4 output:
+
+```bash
+cat solved_positions.jsonl | python3 track-builder/main.py
+```
+
+### Output Format
+
+One JSON object per line (JSONL):
+
+```json
+{"icao":"4CA7E8","lat":50.1596,"lon":-5.6404,"alt_ft":36000,"heading_deg":32.7,"speed_kts":2383.7,"vrate_fpm":23.0,"track_quality":2,"positions_count":2,"residual_m":120.5,"gdop":3.2,"num_sensors":4,"solve_method":"inamdar_4sensor_alt","timestamp_s":43201,"timestamp_ns":500000000,"df_type":4,"squawk":null,"raw_msg":"2000171806A984","t0_s":43201.000499833}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `icao` | string | 6-char hex ICAO aircraft address |
+| `lat` | float | EKF-smoothed latitude (WGS84) |
+| `lon` | float | EKF-smoothed longitude (WGS84) |
+| `alt_ft` | float | Altitude in feet |
+| `heading_deg` | float | Ground track heading (degrees, 0=North) |
+| `speed_kts` | float | Ground speed (knots) |
+| `vrate_fpm` | float | Vertical rate (feet/min) |
+| `track_quality` | int | Number of accepted EKF updates for this track |
+| `positions_count` | int | Total positions in track history |
+| All Layer 4 fields | — | Passed through from the input fix |
+
+Logs and statistics are written to stderr every 30 seconds.
+
+### Module Structure
+
+| Module | Description | Reference |
+|--------|-------------|-----------|
+| `ekf.py` | Custom 6-state Extended Kalman Filter | Part 22 |
+| `tracker.py` | Per-ICAO track association and management | Part 3.2 |
+| `main.py` | stdin/stdout JSONL entry point | — |
+
+## Layer 6: Live Map
+
+Real-time web visualization of aircraft tracks using MapLibre GL JS + Deck.gl. A FastAPI backend reads Layer 5 output and broadcasts track state to connected browsers via WebSocket.
+
+### Technology Stack (Part 5.2, Part 14)
+
+| Component | Library | Version |
+|-----------|---------|---------|
+| Backend | FastAPI + uvicorn | 0.135.1 |
+| Map renderer | MapLibre GL JS | 5.20.2 |
+| Data layers | Deck.gl | 9.2.11 |
+| Real-time transport | WebSocket | — |
+
+### Architecture
+
+```
+Layer 5 (JSONL stdout) → stdin → FastAPI Backend → WebSocket → Browser
+                                      ↓
+                              REST /api/aircraft (polling fallback)
+```
+
+### Visualization Layers
+
+| Deck.gl Layer | Purpose |
+|---------------|---------|
+| `ScatterplotLayer` | Aircraft positions colored by altitude |
+| `TextLayer` | ICAO address labels |
+| `PathLayer` | Flight trail history (last 50 positions) |
+| `ScatterplotLayer` | Sensor positions (Cornwall network) |
+
+### Altitude Color Coding
+
+| Color | Altitude Range |
+|-------|---------------|
+| Green | < 10,000 ft |
+| Cyan | 10,000 – 25,000 ft |
+| Purple | 25,000 – 35,000 ft |
+| Orange | > 35,000 ft |
+
+### Configuration
+
+Environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MLAT_MAP_HOST` | `0.0.0.0` | Server bind address |
+| `MLAT_MAP_PORT` | `8080` | Server port |
+| `MLAT_UPDATE_INTERVAL` | `1.0` | WebSocket push interval (seconds) |
+
+### Install
+
+```bash
+pip install -r live-map/requirements.txt
+```
+
+### Run
+
+Full pipeline (Layer 1 → 2 → 3 → 4 → 5 → 6):
+
+```bash
+./data-pipe/mlat-pipe | python3 modes-decoder/main.py | python3 correlation-engine/main.py | python3 mlat-solver/main.py | python3 track-builder/main.py | python3 live-map/server.py
+```
+
+Or run with synthetic demo data (no pipeline required):
+
+```bash
+python3 live-map/server.py --demo
+```
+
+Then open `http://localhost:8080` in a browser.
+
+### Endpoints
+
+| Endpoint | Protocol | Description |
+|----------|----------|-------------|
+| `GET /` | HTTP | Main map page |
+| `GET /api/aircraft` | HTTP | Current aircraft state (JSON) |
+| `WS /ws` | WebSocket | Real-time aircraft updates |
+
+### WebSocket Message Format
+
+```json
+{
+  "type": "update",
+  "timestamp": 1711234567.89,
+  "aircraft": [
+    {
+      "icao": "4CA7E8",
+      "lat": 50.15,
+      "lon": -5.65,
+      "alt_ft": 36000,
+      "heading_deg": 32.7,
+      "speed_kts": 450.2,
+      "vrate_fpm": -200,
+      "track_quality": 12,
+      "trail": [[-5.70, 50.10], [-5.68, 50.12], [-5.65, 50.15]]
+    }
+  ],
+  "count": 1
+}
+```
