@@ -164,3 +164,96 @@ One JSON object per line (JSONL):
 Each reception contains: `sensor_id`, `lat`, `lon`, `alt`, `timestamp_s`, `timestamp_ns`.
 
 Logs and statistics are written to stderr every 30 seconds.
+
+## Layer 4: MLAT Solver
+
+Computes aircraft positions from correlation groups using Time Difference of Arrival (TDOA). Implements the Frisch TOA formulation with Inamdar algebraic initialization, Markochev atmospheric refraction correction, and Huber-loss outlier robustness.
+
+### Solver Pipeline (Part 20)
+
+1. **Route by sensor count:**
+   - 5+ sensors → Inamdar exact algebraic solution (no iteration needed)
+   - 4 sensors + altitude → Inamdar with altitude disambiguation
+   - 3 sensors + altitude → Constrained TDOA (determined system)
+   - 2 sensors → Skip (prediction-aided requires Layer 5 tracker)
+   - 0-1 sensors → Cannot solve
+
+2. **Iterative refinement:** Frisch TOA formulation (`scipy.optimize.least_squares`)
+   - `method='trf'` (Trust Region Reflective)
+   - `loss='huber'` for outlier robustness (Part 21)
+   - Atmospheric refraction-corrected velocity per sensor pair (Markochev model)
+
+3. **Validation:**
+   - Position within 500 km of all sensors
+   - GDOP ≤ 20 (Part 4.3)
+   - Residual ≤ 10,000 m
+   - Altitude consistency check
+
+### Key Innovation: Frisch TOA (Part 18)
+
+Instead of forming pairwise TDOA equations (which loses information and introduces correlated noise), the solver keeps all N TOA equations and eliminates the unknown transmission time analytically:
+
+```
+t0_hat(x) = mean(t_i - ||x - s_i|| / c_i)
+```
+
+This reduces the problem from 4D (x, y, z, t0) to 3D (x, y, z).
+
+### Install
+
+```bash
+pip install -r mlat-solver/requirements.txt
+```
+
+### Run
+
+Full pipeline (Layer 1 → 2 → 3 → 4):
+
+```bash
+./data-pipe/mlat-pipe | python3 modes-decoder/main.py | python3 correlation-engine/main.py | python3 mlat-solver/main.py
+```
+
+Or replay from saved Layer 3 output:
+
+```bash
+cat correlated_groups.jsonl | python3 mlat-solver/main.py
+```
+
+### Output Format
+
+One JSON object per line (JSONL):
+
+```json
+{"icao":"4CA7E8","lat":50.15,"lon":-5.5,"alt_ft":36000.0,"residual_m":1.31,"gdop":4.5,"num_sensors":5,"solve_method":"inamdar_5sensor","timestamp_s":43200,"timestamp_ns":47198,"df_type":4,"squawk":null,"raw_msg":"2000171806A983","t0_s":43199.999999988}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `icao` | string | 6-char hex ICAO aircraft address |
+| `lat` | float | Solved latitude (WGS84) |
+| `lon` | float | Solved longitude (WGS84) |
+| `alt_ft` | float | Altitude in feet (from Mode-S or solved) |
+| `residual_m` | float | RMS residual in meters |
+| `gdop` | float | Geometric Dilution of Precision |
+| `num_sensors` | int | Number of sensors used |
+| `solve_method` | string | Algorithm used for initialization |
+| `timestamp_s` | int | Reference reception time (seconds) |
+| `timestamp_ns` | int | Reference reception time (nanoseconds) |
+| `df_type` | int | Downlink Format number |
+| `squawk` | string\|null | 4-digit squawk code |
+| `raw_msg` | string | Original hex message |
+| `t0_s` | float | Estimated transmission time (seconds) |
+
+Logs and statistics are written to stderr every 30 seconds.
+
+### Module Structure
+
+| Module | Description | Reference |
+|--------|-------------|-----------|
+| `geo.py` | WGS84 ↔ ECEF coordinate conversions | — |
+| `atmosphere.py` | Markochev atmospheric refraction model | Part 13.2 |
+| `gdop.py` | GDOP computation | Part 4.3, Part 22 |
+| `inamdar.py` | Algebraic TDOA initialization | Part 19 |
+| `frisch.py` | Frisch TOA iterative refinement | Part 18, Part 22 |
+| `solver.py` | Full pipeline routing + validation | Part 20 |
+| `main.py` | stdin/stdout JSONL entry point | — |
