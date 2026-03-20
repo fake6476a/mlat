@@ -21,8 +21,13 @@ All logs go to stderr to keep stdout as a clean data stream.
 """
 
 import json
+import os
 import sys
 import time
+
+# Ensure imports work regardless of CWD
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from decoder import decode_message
 
 # Stats counters

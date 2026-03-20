@@ -25,9 +25,6 @@ DF_WITH_ALTITUDE = {0, 4, 16, 20}
 # DF types that carry identity/squawk in the ID field
 DF_WITH_SQUAWK = {5, 21}
 
-# DF types where ICAO is transmitted in the clear (bits 9-32)
-DF_ICAO_CLEAR = {11, 17, 18}
-
 # DF types where ICAO must be recovered via AP XOR CRC
 DF_ICAO_PARITY = {0, 4, 5, 16, 20, 21}
 
