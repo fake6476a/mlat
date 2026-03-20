@@ -98,7 +98,7 @@ class CorrelationGroup:
     def num_sensors(self) -> int:
         return len(self.receptions)
 
-    def has_unique_sensor(self, sensor_id: int) -> bool:
+    def has_sensor(self, sensor_id: int) -> bool:
         """Check if this sensor already contributed to this group."""
         return any(r.sensor_id == sensor_id for r in self.receptions)
 
@@ -180,7 +180,7 @@ class Correlator:
             # Check if this reception is within the time window
             if current_time_ns - group.first_time_ns <= self.window_ns:
                 # Skip duplicate sensor in same group
-                if not group.has_unique_sensor(sensor_id):
+                if not group.has_sensor(sensor_id):
                     group.receptions.append(reception)
             else:
                 # Window expired for this specific key; emit old, start new
