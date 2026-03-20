@@ -10,6 +10,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -49,6 +50,8 @@ func main() {
 	log.Println("=== MLAT Data Pipe v" + Version + " ===")
 	log.Println("Starting Neuron SDK buyer node...")
 	log.Println("Mode-S packets will be emitted as JSON on stdout")
+
+	setDefaultFlags()
 
 	go logStats()
 
@@ -212,5 +215,33 @@ func logStats() {
 			return true
 		})
 		log.Printf("Stats: packets=%d, active_sensors=%d", count, sensorCount)
+	}
+}
+
+// setDefaultFlags injects sensible defaults for the Neuron SDK flags
+// so the user doesn't have to pass them on every run.
+func setDefaultFlags() {
+	hasFlag := func(name string) bool {
+		for _, arg := range os.Args[1:] {
+			if strings.Contains(arg, name) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Default to reading sellers from env file (list_of_sellers in .buyer-env)
+	// instead of querying the Neuron Explorer API.
+	if !hasFlag("list-of-sellers-source") {
+		os.Args = append(os.Args, "--list-of-sellers-source", "env")
+		log.Println("Defaulting --list-of-sellers-source to 'env'")
+	}
+
+	// Auto-detect .buyer-env if no --envFile was specified and .buyer-env exists.
+	if !hasFlag("envFile") {
+		if _, err := os.Stat(".buyer-env"); err == nil {
+			os.Args = append(os.Args, "--envFile", ".buyer-env")
+			log.Println("Auto-detected .buyer-env file")
+		}
 	}
 }
