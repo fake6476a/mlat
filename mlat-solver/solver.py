@@ -161,18 +161,22 @@ def solve_group(group: dict) -> SolveResult | None:
     sensor_alts_m = np.zeros(n_sensors)
     arrival_times = np.zeros(n_sensors)
 
+    # Compute reference timestamp (earliest reception) to prevent float64 precision loss!
+    # If timestamp_s is large (e.g. UNIX epoch), adding nanoseconds as float will truncate.
+    # We must make it relative first before casting to float.
+    ref_idx = min(range(n_sensors), key=lambda i: receptions[i]["timestamp_s"] * 1000000000 + receptions[i]["timestamp_ns"])
+    ref_timestamp_s = receptions[ref_idx]["timestamp_s"]
+    ref_timestamp_ns = receptions[ref_idx]["timestamp_ns"]
+
     for i, rec in enumerate(receptions):
         sensor_positions[i] = lla_to_ecef(
             rec["lat"], rec["lon"], rec["alt"]
         )
         sensor_alts_m[i] = rec["alt"]
-        # Convert timestamp to seconds (high precision)
-        arrival_times[i] = rec["timestamp_s"] + rec["timestamp_ns"] * 1e-9
-
-    # Compute reference timestamp (earliest reception)
-    ref_idx = np.argmin(arrival_times)
-    ref_timestamp_s = receptions[ref_idx]["timestamp_s"]
-    ref_timestamp_ns = receptions[ref_idx]["timestamp_ns"]
+        # Make timestamp relative BEFORE converting to float to save precision
+        dt_s = rec["timestamp_s"] - ref_timestamp_s
+        dt_ns = rec["timestamp_ns"] - ref_timestamp_ns
+        arrival_times[i] = dt_s + dt_ns * 1e-9
 
     # Step 1: Algebraic initialization — route by sensor count
     x0 = None
@@ -233,16 +237,22 @@ def solve_group(group: dict) -> SolveResult | None:
     # 3a. Range check — position must be within MAX_RANGE of all sensors
     for s in sensor_positions:
         if np.linalg.norm(position - s) > MAX_RANGE_M:
+            print("Failed range check")
             return None
 
     # 3b. Residual check
     if residual_m > MAX_RESIDUAL_M:
+        print("Failed residual check")
         return None
 
     # 3c. GDOP computation (Part 4.3)
-    gdop = compute_gdop(position, sensor_positions)
-    if gdop > MAX_GDOP:
-        return None
+    # A full 3D+Time GDOP requires a 4x4 matrix inversion which is singular for < 4 sensors.
+    if n_sensors >= 4:
+        gdop = compute_gdop(position, sensor_positions)
+        if gdop > MAX_GDOP:
+            return None
+    else:
+        gdop = 0.0  # GDOP is not applicable for 2.5D determined systems
 
     # Convert result back to WGS84
     lat, lon, alt_m = ecef_to_lla(position[0], position[1], position[2])

@@ -76,6 +76,14 @@ def frisch_residual(
     # Residuals in distance units
     residuals = (arrival_times - t0_hat) * velocities - ranges
 
+    # Optional: altitude constraint as a pseudo-sensor
+    if aircraft_alt_m is not None:
+        from geo import ecef_to_lla
+        _, _, current_alt = ecef_to_lla(x[0], x[1], x[2])
+        # Extremely strong weight to force altitude adherence
+        alt_residual = (current_alt - aircraft_alt_m) * 10.0
+        residuals = np.append(residuals, alt_residual)
+
     return residuals
 
 
@@ -114,9 +122,9 @@ def solve_toa(
             x0,
             args=(sensors, arrival_times, sensor_alts_m, altitude_m, c),
             method="trf",
-            loss="huber",
-            f_scale=100.0,  # Huber transition at 100m residual
-            max_nfev=max_nfev,
+            loss="soft_l1",
+            f_scale=1000.0,  # Looser outlier transition so far initialization doesn't plateau
+            max_nfev=1000,
         )
 
         if not result.success and result.status <= 0:
