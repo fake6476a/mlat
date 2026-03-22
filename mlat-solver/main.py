@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
-"""Layer 4: MLAT Solver
+"""Layer 4: MLAT Solver (Enhanced)
 
 Reads Layer 3 JSONL correlation groups from stdin, solves each group
 to compute aircraft position using TDOA/TOA multilateration, and
 outputs position fixes as JSONL to stdout.
 
-Solver pipeline (from MLAT_Verified_Combined_Reference.md Part 20):
+Enhanced pipeline (implements LAYER4_IMPROVEMENT_PLAN.md):
+
+0. Clock Calibration (Phase 1):
+   - DF17 messages with ADS-B positions used as reference beacons
+   - Pairwise receiver clock offsets tracked via PI controller
+   - All timestamps corrected before solving
 
 1. Route by sensor count:
    - 5+ sensors → Inamdar exact algebraic (no iteration)
-   - 4 sensors + altitude → Inamdar with altitude disambiguation
+   - 4 sensors (with or without altitude) → Frisch TOA (Phase 2)
    - 3 sensors + altitude → Constrained TDOA
-   - 2 sensors → Skip (prediction-aided requires Layer 5 tracker)
+   - 2 sensors + altitude + cached position → Prediction-aided (Phase 4)
    - 0-1 sensors → Cannot solve
 
 2. Iterative refinement:
    - Frisch TOA formulation with scipy.optimize.least_squares
-   - loss='huber' for outlier robustness
+   - loss='soft_l1' for outlier robustness
    - Atmospheric refraction velocity (Markochev model)
+   - Position cache provides better initial guesses (Phase 3)
 
 3. Validation:
    - Position within MAX_RANGE of all sensors
@@ -32,29 +38,10 @@ Usage:
     Or replay from saved Layer 3 output:
     cat correlated_data.jsonl | python3 mlat-solver/main.py
 
-Input (JSONL from Layer 3):
-    {"icao":"4CA7E8","df_type":4,"altitude_ft":36000,"squawk":null,
-     "raw_msg":"2000171806A983","num_sensors":3,
-     "receptions":[
-       {"sensor_id":1001,"lat":50.1,"lon":-5.7,"alt":100.0,
-        "timestamp_s":43200,"timestamp_ns":500000000},
-       {"sensor_id":1002,"lat":50.2,"lon":-5.6,"alt":105.0,
-        "timestamp_s":43200,"timestamp_ns":500000050},
-       {"sensor_id":1003,"lat":50.3,"lon":-5.5,"alt":110.0,
-        "timestamp_s":43200,"timestamp_ns":500000100}
-     ]}
-
-Output (JSONL):
-    {"icao":"4CA7E8","lat":50.15,"lon":-5.65,"alt_ft":36000,
-     "residual_m":145.23,"gdop":3.45,"num_sensors":3,
-     "solve_method":"constrained_3sensor",
-     "timestamp_s":43200,"timestamp_ns":500000000,
-     "df_type":4,"squawk":null,"raw_msg":"2000171806A983",
-     "t0_s":43200.000499833}
-
 All logs go to stderr to keep stdout as a clean data stream.
 """
 
+import copy
 import json
 import os
 import sys
@@ -62,11 +49,20 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from geo import lla_to_ecef
-C_VACUUM = 299792458.0
+import numpy as np
 
+from adsb_decoder import (
+    CPRBuffer,
+    extract_df17_position_fields,
+    extract_df17_velocity,
+    position_to_ecef,
+)
+from clock_sync import ClockCalibrator
+from geo import ft_to_m, lla_to_ecef
+from position_cache import PositionCache
 from solver import solve_group
 
+C_VACUUM = 299792458.0
 STATS_INTERVAL = 30  # seconds
 
 
@@ -82,6 +78,8 @@ class Stats:
         self.parse_errors = 0
         # Per-method counters
         self.method_counts: dict[str, int] = {}
+        # Q2: Failure reason histogram
+        self.failure_reasons: dict[str, int] = {}
         # Residual tracking
         self.residuals: list[float] = []
         # Clock sync validation (rolling 100 samples per sensor)
@@ -112,6 +110,7 @@ class Stats:
                 else "0.0%"
             ),
             "methods": self.method_counts,
+            "failure_reasons": self.failure_reasons,
         }
         if self.residuals:
             sorted_r = sorted(self.residuals)
@@ -135,24 +134,245 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+def _extract_df17_altitude(raw_msg: str) -> int | None:
+    """Extract altitude from a DF17 TC 9-18 airborne position message.
+
+    The ME field carries a 12-bit altitude code that the original decoder
+    misses (it only extracts altitude from DF0/4/16/20 via pms.altcode).
+    This function extracts it directly from the raw hex bytes.
+
+    Args:
+        raw_msg: 28-char hex DF17 message.
+
+    Returns:
+        Altitude in feet, or None.
+    """
+    frame = extract_df17_position_fields(raw_msg)
+    if frame is not None:
+        return frame.alt_ft
+    return None
+
+
+def _process_group(
+    group: dict,
+    clock_cal: ClockCalibrator,
+    pos_cache: PositionCache,
+    cpr_buffer: CPRBuffer,
+    stats: Stats,
+    counters: dict,
+    now: float,
+) -> None:
+    """Process a single correlation group through the full pipeline."""
+    receptions = group.get("receptions", [])
+    n_sensors = len(receptions)
+    if n_sensors < 2:
+        stats.groups_skipped_sensors += 1
+        return
+
+    icao = group.get("icao", "")
+    raw_msg = group.get("raw_msg", "")
+    msg_timestamp = None
+    if receptions:
+        msg_timestamp = (
+            receptions[0]["timestamp_s"]
+            + receptions[0]["timestamp_ns"] * 1e-9
+        )
+
+    # =============================================================
+    # Phase 5: ADS-B CPR Decode — free cache seeding
+    # =============================================================
+    if group.get("df_type") == 17 and len(raw_msg) == 28:
+        cpr_frame = extract_df17_position_fields(raw_msg)
+        if cpr_frame is not None and msg_timestamp is not None:
+            cpr_frame.timestamp = msg_timestamp
+            decoded = cpr_buffer.add_frame(icao, cpr_frame)
+            if decoded is not None:
+                alt_m = ft_to_m(decoded.alt_ft) if decoded.alt_ft is not None else None
+                if alt_m is None:
+                    cached_entry = pos_cache.get(icao, msg_timestamp)
+                    if cached_entry is not None:
+                        alt_m = cached_entry.alt_m
+
+                if alt_m is not None:
+                    decoded_ecef = position_to_ecef(
+                        decoded.lat, decoded.lon, decoded.alt_ft
+                    )
+                else:
+                    decoded_ecef = position_to_ecef(
+                        decoded.lat, decoded.lon, None
+                    )
+                    alt_m = 10000.0
+
+                pos_cache.put(
+                    icao=icao, ecef=decoded_ecef,
+                    lat=decoded.lat, lon=decoded.lon,
+                    alt_m=alt_m, timestamp=msg_timestamp,
+                )
+                counters["cpr_seeds"] += 1
+
+                clock_cal.process_adsb_reference(
+                    aircraft_ecef=decoded_ecef,
+                    receptions=receptions, now=now,
+                )
+
+    # Phase 5b: ADS-B Velocity Decode (TC 19)
+    if group.get("df_type") == 17 and len(raw_msg) == 28 and msg_timestamp is not None:
+        vel = extract_df17_velocity(raw_msg)
+        if vel is not None:
+            KTS_TO_MPS = 0.514444
+            pos_cache.update_velocity_from_adsb(
+                icao=icao,
+                ew_mps=vel.ew_knots * KTS_TO_MPS,
+                ns_mps=vel.ns_knots * KTS_TO_MPS,
+                vrate_mps=vel.vrate_fpm * 0.00508,
+                timestamp=msg_timestamp,
+            )
+
+    # =============================================================
+    # Phase 6: Altitude augmentation
+    # =============================================================
+    effective_alt_ft = group.get("altitude_ft")
+
+    if effective_alt_ft is None and group.get("df_type") == 17:
+        df17_alt = _extract_df17_altitude(raw_msg)
+        if df17_alt is not None:
+            effective_alt_ft = df17_alt
+            counters["df17_alt_extracted"] += 1
+
+    if effective_alt_ft is None and msg_timestamp is not None:
+        cached_for_alt = pos_cache.get(icao, msg_timestamp)
+        if cached_for_alt is not None and cached_for_alt.alt_m is not None:
+            effective_alt_ft = round(cached_for_alt.alt_m / 0.3048)
+            counters["cached_alt_used"] += 1
+
+    working_group = group
+    if effective_alt_ft != group.get("altitude_ft"):
+        working_group = dict(group)
+        working_group["altitude_ft"] = effective_alt_ft
+
+    # =============================================================
+    # Phase 1: Clock Calibration — apply corrections
+    # =============================================================
+    corrected_receptions = copy.deepcopy(receptions)
+    if clock_cal.has_any_calibration(corrected_receptions):
+        clock_cal.correct_timestamps(corrected_receptions, now)
+        corrected_group = dict(working_group)
+        corrected_group["receptions"] = corrected_receptions
+    else:
+        corrected_group = working_group
+
+    # =============================================================
+    # Phase 3: Position cache lookup
+    # =============================================================
+    cached = pos_cache.get(icao, msg_timestamp)
+    position_prior = cached.predict(msg_timestamp) if (cached and msg_timestamp) else None
+
+    # =============================================================
+    # Phase 4: 2-sensor gate — require altitude + cached prior
+    # =============================================================
+    MAX_PAIR_VARIANCE_US2 = 50.0
+    if n_sensors == 2 and effective_alt_ft is not None:
+        if position_prior is None:
+            output = {"unsolved_group": group}
+            print(json.dumps(output, separators=(",", ":")), flush=True)
+            stats.groups_skipped_sensors += 1
+            stats.failure_reasons["no_prior_2sensor"] = stats.failure_reasons.get("no_prior_2sensor", 0) + 1
+            return
+
+        if len(corrected_receptions) == 2:
+            s_a = corrected_receptions[0].get("sensor_id")
+            s_b = corrected_receptions[1].get("sensor_id")
+            if s_a is not None and s_b is not None:
+                pair_key = (min(s_a, s_b), max(s_a, s_b))
+                pairing = clock_cal.pairings.get(pair_key)
+                if pairing is not None and pairing.valid:
+                    pair_var_us2 = pairing.variance * 1e12
+                    if pair_var_us2 > MAX_PAIR_VARIANCE_US2:
+                        output = {"unsolved_group": group}
+                        print(json.dumps(output, separators=(",", ":")), flush=True)
+                        stats.groups_skipped_sensors += 1
+                        stats.failure_reasons["pair_variance_exceeded"] = stats.failure_reasons.get("pair_variance_exceeded", 0) + 1
+                        return
+
+    # =============================================================
+    # Solve the correlation group
+    # =============================================================
+    result, fail_reason = solve_group(corrected_group, position_prior_ecef=position_prior)
+
+    if result is not None:
+        aircraft_ecef = lla_to_ecef(
+            result.lat, result.lon, result.alt_ft * 0.3048
+        )
+        if cached is not None and msg_timestamp is not None:
+            if not cached.is_physically_consistent(
+                aircraft_ecef, msg_timestamp,
+                new_residual_m=result.residual_m,
+            ):
+                stats.groups_failed += 1
+                stats.failure_reasons["physically_inconsistent"] = stats.failure_reasons.get("physically_inconsistent", 0) + 1
+                return
+
+        output = result.to_dict()
+        print(json.dumps(output, separators=(",", ":")), flush=True)
+        stats.record_solve(result.solve_method, result.residual_m)
+        if msg_timestamp is not None:
+            pos_cache.put(
+                icao=icao, ecef=aircraft_ecef,
+                lat=result.lat, lon=result.lon,
+                alt_m=result.alt_ft * 0.3048,
+                timestamp=msg_timestamp,
+                residual_m=result.residual_m,
+            )
+
+        # Q9: Only feed solver positions back to clock cal if low residual.
+        # Prevents high-residual solves from contaminating calibration.
+        # CPR-decoded positions (line 210) remain the primary trusted source.
+        # Sweep showed <200m is optimal: recovers sync points while filtering junk.
+        if result.residual_m < 200.0:
+            clock_cal.process_adsb_reference(
+                aircraft_ecef=aircraft_ecef,
+                receptions=receptions, now=now,
+            )
+
+        for rec in receptions:
+            s_id = rec.get("sensor_id")
+            if s_id is not None:
+                s_pos = lla_to_ecef(rec["lat"], rec["lon"], rec["alt"])
+                dt_s = rec["timestamp_s"] - result.timestamp_s
+                dt_ns = rec["timestamp_ns"] - result.timestamp_ns
+                arr_time = dt_s + dt_ns * 1e-9
+                dist = float(np.linalg.norm(aircraft_ecef - s_pos))
+                expected_arr = dist / C_VACUUM
+                actual_arr = arr_time - result.t0_s
+                residual_m = (actual_arr - expected_arr) * C_VACUUM
+                stats.record_sensor_residual(s_id, residual_m)
+    else:
+        stats.groups_failed += 1
+        if fail_reason:
+            stats.failure_reasons[fail_reason] = stats.failure_reasons.get(fail_reason, 0) + 1
+
+        # For 2-sensor failures with altitude, still pass downstream
+        if n_sensors == 2 and effective_alt_ft is not None:
+            output = {"unsolved_group": group}
+            print(json.dumps(output, separators=(",", ":")), flush=True)
+
+
 def main() -> None:
-    log("=== MLAT Solver (Layer 4) ===")
-    log("Reading JSONL correlation groups from stdin")
+    log("=== MLAT Solver (Layer 4) — Enhanced with ADS-B CPR Seeding ===")
     log("Solver: Frisch TOA formulation with Inamdar algebraic initialization")
-    log("Loss: Huber (outlier-robust)")
-    log("Atmospheric model: Markochev refraction correction")
-    log(f"Stats logged every {STATS_INTERVAL}s to stderr")
 
     stats = Stats()
-    last_stats_time = time.monotonic()
+    clock_cal = ClockCalibrator()
+    pos_cache = PositionCache()
+    cpr_buffer = CPRBuffer()
+
+    counters = {"cpr_seeds": 0, "df17_alt_extracted": 0, "cached_alt_used": 0}
 
     try:
         for line in sys.stdin:
             line = line.strip()
             if not line:
                 continue
-
-            # Parse input JSON
             try:
                 group = json.loads(line)
             except (json.JSONDecodeError, TypeError):
@@ -161,64 +381,39 @@ def main() -> None:
 
             stats.groups_received += 1
 
-            # Check minimum sensor count before attempting solve
-            receptions = group.get("receptions", [])
-            n_sensors = len(receptions)
-            if n_sensors < 2:
-                stats.groups_skipped_sensors += 1
-                continue
-
-            # Pass 2-sensor groups downstream for track-builder prediction-aided solve
-            if n_sensors == 2 and group.get("altitude_ft") is not None:
-                # We need altitude to constrain the 2-sensor system
-                output = {"unsolved_group": group}
-                print(json.dumps(output, separators=(",", ":")), flush=True)
-                stats.groups_skipped_sensors += 1
-                continue
-
-            # Solve the correlation group (>= 3 sensors)
-            result = solve_group(group)
-
-            if result is not None:
-                # Output solved position fix
-                output = result.to_dict()
-                print(json.dumps(output, separators=(",", ":")), flush=True)
-                stats.record_solve(result.solve_method, result.residual_m)
-
-                # Back-compute individual sensor residuals for Clock Sync validation
-                aircraft_ecef = lla_to_ecef(result.lat, result.lon, result.alt_ft * 0.3048)
-                for rec in group.get("receptions", []):
-                    s_id = rec.get("sensor_id")
-                    if s_id is not None:
-                        s_pos = lla_to_ecef(rec["lat"], rec["lon"], rec["alt"])
-                        dt_s = rec["timestamp_s"] - result.timestamp_s
-                        dt_ns = rec["timestamp_ns"] - result.timestamp_ns
-                        arr_time = dt_s + dt_ns * 1e-9
-                        
-                        dist = ((aircraft_ecef[0] - s_pos[0])**2 + 
-                                (aircraft_ecef[1] - s_pos[1])**2 + 
-                                (aircraft_ecef[2] - s_pos[2])**2)**0.5
-                                
-                        expected_arr = dist / C_VACUUM
-                        actual_arr = arr_time - result.t0_s
-                        residual_m = (actual_arr - expected_arr) * C_VACUUM
-                        stats.record_sensor_residual(s_id, residual_m)
+            # Use message timestamp for clock sync (Q1 fix: time.monotonic()
+            # gives ~ms dt in batch replay; message timestamps give real seconds)
+            _receptions = group.get("receptions", [])
+            if _receptions:
+                _msg_ts = (
+                    _receptions[0]["timestamp_s"]
+                    + _receptions[0]["timestamp_ns"] * 1e-9
+                )
             else:
-                stats.groups_failed += 1
+                _msg_ts = time.monotonic()
 
-            # Periodic stats
-            now = time.monotonic()
-            if now - last_stats_time >= STATS_INTERVAL:
-                log(f"[stats] {json.dumps(stats.to_dict())}")
-                last_stats_time = now
+            _process_group(
+                group, clock_cal, pos_cache, cpr_buffer,
+                stats, counters, _msg_ts,
+            )
 
     except KeyboardInterrupt:
         log("Interrupted by user")
     except BrokenPipeError:
         pass
     finally:
+        final_stats = stats.to_dict()
+        final_stats["clock_cal"] = clock_cal.stats_dict()
+        final_stats["pos_cache"] = pos_cache.stats_dict()
+        final_stats["cpr_buffer"] = cpr_buffer.stats_dict()
+        final_stats["cpr_cache_seeds"] = counters["cpr_seeds"]
+        final_stats["df17_alt_extracted"] = counters["df17_alt_extracted"]
+        final_stats["cached_alt_used"] = counters["cached_alt_used"]
         log("Shutting down. Final stats:")
-        log(f"[stats] {json.dumps(stats.to_dict(), indent=2)}")
+        log(f"[stats] {json.dumps(final_stats, indent=2)}")
+        log(f"Clock calibration: {clock_cal.calibrated_pairs} valid pairings")
+        log(f"Position cache: {len(pos_cache.cache)} aircraft tracked")
+        log(f"CPR cache seeds: {counters['cpr_seeds']} (global={cpr_buffer.global_decodes}, local={cpr_buffer.local_decodes})")
 
 
 if __name__ == "__main__":

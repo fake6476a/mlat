@@ -113,6 +113,19 @@ def decode_message(raw_msg: str) -> dict | None:
         except Exception:
             pass
 
+    # Decode altitude from DF17 TC 9-18 airborne position messages.
+    # These carry altitude in the ME field (12-bit Q-bit encoded),
+    # which pms.altcode() does not extract for DF17.
+    if df == 17 and len(msg) == 28 and result["altitude_ft"] is None:
+        try:
+            tc = pms.adsb.typecode(msg)
+            if tc is not None and 9 <= tc <= 18:
+                alt = pms.adsb.altitude(msg)
+                if alt is not None:
+                    result["altitude_ft"] = int(alt)
+        except Exception:
+            pass
+
     # Decode squawk/identity for DF types that carry it
     if df in DF_WITH_SQUAWK:
         try:

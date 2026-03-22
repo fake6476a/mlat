@@ -39,6 +39,7 @@ def frisch_residual(
     aircraft_alt_m: float | None,
     track_prediction_ecef: np.ndarray | None = None,
     c: float = C_VACUUM,
+    prediction_weight: float = 8.0,
 ) -> np.ndarray:
     """Compute TOA residuals with analytical t0 elimination.
 
@@ -81,16 +82,20 @@ def frisch_residual(
     if aircraft_alt_m is not None:
         from geo import ecef_to_lla
         _, _, current_alt = ecef_to_lla(x[0], x[1], x[2])
-        # Extremely strong weight to force altitude adherence
+        # Strong weight to force altitude adherence (critical for 2-sensor)
         alt_residual = (current_alt - aircraft_alt_m) * 10.0
         residuals = np.append(residuals, alt_residual)
 
     # Optional: prediction anchor for underdetermined 2-sensor fallback
     if track_prediction_ecef is not None:
-        # Soft constraint forcing the solver to pick the intersection point
-        # closest to the EKF prediction. Weight = 0.5 balances geometry vs prediction.
-        pred_residual = np.linalg.norm(x - track_prediction_ecef) * 0.5
-        residuals = np.append(residuals, pred_residual)
+        # Per-axis soft constraint forcing the solver to pick the intersection
+        # closest to the EKF prediction. Weight = 5.0 provides a strong anchor
+        # for under-determined 2-sensor systems while still allowing geometry
+        # to shift the solution when TDOA data clearly supports it.
+        # Using per-axis residuals (3 values) instead of scalar distance
+        # gives the optimizer better gradient information.
+        pred_residuals = (x - track_prediction_ecef) * prediction_weight
+        residuals = np.append(residuals, pred_residuals)
 
     return residuals
 
@@ -103,7 +108,8 @@ def solve_toa(
     altitude_m: float | None = None,
     track_prediction_ecef: np.ndarray | None = None,
     c: float = C_VACUUM,
-    max_nfev: int = 50,
+    max_nfev: int = 1000,
+    prediction_weight: float = 8.0,
 ) -> dict | None:
     """Iterative MLAT solve using Frisch TOA formulation.
 
@@ -129,11 +135,11 @@ def solve_toa(
         result = least_squares(
             frisch_residual,
             x0,
-            args=(sensors, arrival_times, sensor_alts_m, altitude_m, track_prediction_ecef, c),
+            args=(sensors, arrival_times, sensor_alts_m, altitude_m, track_prediction_ecef, c, prediction_weight),
             method="trf",
             loss="soft_l1",
-            f_scale=1000.0,  # Looser outlier transition so far initialization doesn't plateau
-            max_nfev=1000,
+            f_scale=500.0,  # Moderate outlier transition — balances convergence from far init vs accuracy
+            max_nfev=max_nfev,
         )
 
         if not result.success and result.status <= 0:
@@ -151,9 +157,9 @@ def solve_toa(
             lat, lon, _ = ecef_to_lla(position[0], position[1], position[2])
             position = lla_to_ecef(lat, lon, altitude_m)
 
-        # Compute final residual (RMS of residuals in meters)
+        # Compute final residual (RMS of all residual terms including constraints)
         final_residuals = frisch_residual(
-            position, sensors, arrival_times, sensor_alts_m, altitude_m, track_prediction_ecef, c
+            position, sensors, arrival_times, sensor_alts_m, altitude_m, track_prediction_ecef, c, prediction_weight
         )
         residual_m = float(np.sqrt(np.mean(final_residuals ** 2)))
 
