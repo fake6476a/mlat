@@ -84,6 +84,7 @@ class TrackState:
         alt_ft: float,
         df_type: int,
         squawk: str | None,
+        measurement_noise_m: float | None = None,
     ) -> float:
         """Update track with a new position fix.
 
@@ -93,11 +94,13 @@ class TrackState:
             alt_ft: Altitude in feet.
             df_type: Downlink format type.
             squawk: Squawk code.
+            measurement_noise_m: Per-axis measurement noise (meters),
+                derived from solver residual and GDOP.
 
         Returns:
             Mahalanobis distance (-1.0 if rejected by gate).
         """
-        mahal = self.ekf.update(position_ecef, timestamp_s)
+        mahal = self.ekf.update(position_ecef, timestamp_s, measurement_noise_m)
 
         if mahal >= 0:
             # Measurement accepted
@@ -323,6 +326,16 @@ class TrackManager:
         # Compute timestamp as float seconds
         ts = float(timestamp_s) + float(timestamp_ns) * 1e-9
 
+        # R5+R8: Derive measurement noise from solver residual and GDOP
+        residual_m = fix.get("residual_m", 0.0)
+        gdop = fix.get("gdop", 0.0)
+        if residual_m > 0 and gdop > 0:
+            meas_noise = min(2000.0, max(50.0, residual_m * gdop))
+        elif residual_m > 0:
+            meas_noise = min(2000.0, max(50.0, residual_m * 2.0))
+        else:
+            meas_noise = None  # fall back to EKF default
+
         track = self._tracks.get(icao)
 
         if track is None:
@@ -347,6 +360,7 @@ class TrackManager:
             alt_ft=alt_ft,
             df_type=df_type,
             squawk=squawk,
+            measurement_noise_m=meas_noise,
         )
 
         if mahal < 0:
@@ -396,6 +410,12 @@ class TrackManager:
         target_ts = float(ref_timestamp_s) + float(ref_timestamp_ns) * 1e-9
         predicted_ecef = track.ekf.predict(target_ts)
 
+        # R7: Scale prediction weight by EKF covariance quality.
+        # Tight prediction (low position uncertainty) → strong anchor.
+        # Uncertain prediction → let geometry dominate.
+        pred_uncertainty = float(np.sqrt(np.trace(track.ekf.P[:3, :3])))
+        pw = max(1.0, min(12.0, 500.0 / max(pred_uncertainty, 1.0)))
+
         from frisch import solve_toa
         result = solve_toa(
             sensors=sensor_positions,
@@ -404,6 +424,7 @@ class TrackManager:
             x0=predicted_ecef,
             altitude_m=altitude_m,
             track_prediction_ecef=predicted_ecef,
+            prediction_weight=pw,
         )
 
         if result is None:

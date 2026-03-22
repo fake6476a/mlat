@@ -42,6 +42,11 @@ MAX_SYNC_AGE = 300.0
 # Outlier rejection threshold (multiples of current stddev)
 OUTLIER_SIGMA = 3.5
 
+# R3: Maximum consecutive outlier rejections before resetting the filter.
+# Handles clock steps (e.g., GPS lock changes) that would otherwise cause
+# permanent rejection. Inspired by mutability's 5-outlier counter.
+MAX_CONSECUTIVE_OUTLIERS = 5
+
 # Maximum allowed clock offset magnitude (seconds) — reject if larger
 MAX_CLOCK_OFFSET = 0.5
 
@@ -81,6 +86,7 @@ class ClockPairing:
         "offset", "drift", "variance",
         "p00", "p01", "p11",
         "valid", "last_update",
+        "_consecutive_outliers",
     )
 
     def __init__(self, sensor_a: int, sensor_b: int) -> None:
@@ -98,6 +104,7 @@ class ClockPairing:
         self.variance = 2.5e-9  # = p00, exposed for compatibility
         self.valid = False
         self.last_update = 0.0
+        self._consecutive_outliers = 0
 
     def update(self, measured_offset: float, now: float) -> bool:
         """Add a new sync observation and update the offset/drift estimate.
@@ -139,11 +146,29 @@ class ClockPairing:
         self.p01 = old_p01 + dt * old_p11 + _Q_DRIFT * dt * dt / 2.0
         self.p11 = old_p11 + _Q_DRIFT * dt
 
+        r = _R
+
         # --- Outlier rejection ---
         innovation = measured_offset - self.offset
-        S = self.p00 + _R  # Innovation variance
+        S = self.p00 + r  # Innovation variance
         if self.valid and self.n >= MIN_SYNC_POINTS:
             if abs(innovation) > OUTLIER_SIGMA * (S ** 0.5):
+                self._consecutive_outliers += 1
+                # R3: After too many consecutive outliers, the clock has likely
+                # stepped. Reset the filter to re-acquire from scratch.
+                if self._consecutive_outliers >= MAX_CONSECUTIVE_OUTLIERS:
+                    self.n = 0
+                    self.offset = measured_offset
+                    self.drift = 0.0
+                    self.p00 = _R * 100
+                    self.p01 = 0.0
+                    self.p11 = 1e-12
+                    self.variance = self.p00
+                    self.valid = False
+                    self.n = 1
+                    self.last_update = now
+                    self._consecutive_outliers = 0
+                    return True
                 # Reject but keep the predicted state
                 self.variance = self.p00
                 self.last_update = now
@@ -161,11 +186,11 @@ class ClockPairing:
         # For H=[1,0], K=[k0,k1]': (I-KH) = [[1-k0, 0], [-k1, 1]]
         a = 1.0 - k0
         # new_p00 = a² * p00 + k0² * R
-        new_p00 = a * a * self.p00 + k0 * k0 * _R
+        new_p00 = a * a * self.p00 + k0 * k0 * r
         # new_p01 = a * (-k1 * p00 + p01) + k0 * k1 * R
-        new_p01 = a * (-k1 * self.p00 + self.p01) + k0 * k1 * _R
+        new_p01 = a * (-k1 * self.p00 + self.p01) + k0 * k1 * r
         # new_p11 = k1² * p00 - 2*k1*p01 + p11 + k1² * R
-        new_p11 = k1 * k1 * self.p00 - 2.0 * k1 * self.p01 + self.p11 + k1 * k1 * _R
+        new_p11 = k1 * k1 * self.p00 - 2.0 * k1 * self.p01 + self.p11 + k1 * k1 * r
 
         self.p00 = new_p00
         self.p01 = new_p01
@@ -175,6 +200,7 @@ class ClockPairing:
         self.n += 1
         self.valid = self.n >= MIN_SYNC_POINTS
         self.last_update = now
+        self._consecutive_outliers = 0
 
         return True
 

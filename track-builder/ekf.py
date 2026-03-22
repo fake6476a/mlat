@@ -128,7 +128,8 @@ class AircraftEKF:
 
         return self.x[:3].copy()
 
-    def update(self, measurement: np.ndarray, timestamp_s: float) -> float:
+    def update(self, measurement: np.ndarray, timestamp_s: float,
+               measurement_noise_m: float | None = None) -> float:
         """Update state with a new position measurement.
 
         Performs innovation gating (Mahalanobis distance check) and
@@ -137,6 +138,9 @@ class AircraftEKF:
         Args:
             measurement: Position [x, y, z] in ECEF meters.
             timestamp_s: Measurement timestamp in seconds.
+            measurement_noise_m: Per-axis measurement noise std dev (meters).
+                If provided, overrides the default MEASUREMENT_NOISE_M.
+                Typically derived from solver residual and GDOP.
 
         Returns:
             Mahalanobis distance of the innovation. Returns -1.0 if
@@ -150,7 +154,8 @@ class AircraftEKF:
         H[0, 0] = H[1, 1] = H[2, 2] = 1.0
 
         # Measurement noise covariance R
-        R = np.eye(3) * (self._meas_noise ** 2)
+        noise = measurement_noise_m if measurement_noise_m is not None else self._meas_noise
+        R = np.eye(3) * (noise ** 2)
 
         # Innovation (residual)
         y = measurement - H @ self.x

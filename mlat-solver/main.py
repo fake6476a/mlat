@@ -428,7 +428,10 @@ def _process_group(
         # Prevents high-residual solves from contaminating calibration.
         # CPR-decoded positions (line 210) remain the primary trusted source.
         # Sweep showed <200m is optimal: recovers sync points while filtering junk.
-        if result.residual_m < 200.0:
+        # R10: Additionally require that at least one clock pair in this group
+        # is already converged. This prevents early noisy solves from corrupting
+        # freshly initializing pairs — only calibrated pairs get refinement.
+        if result.residual_m < 200.0 and clock_cal.has_any_calibration(receptions):
             clock_cal.process_adsb_reference(
                 aircraft_ecef=aircraft_ecef,
                 receptions=receptions, now=now,
