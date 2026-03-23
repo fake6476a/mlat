@@ -194,7 +194,6 @@
     // ── State ──────────────────────────────────────────────────────
     let aircraftData = [];
     let trailData = [];
-    let gdopGrid = [];
     let updateCount = 0;
     let ws = null;
     let reconnectTimer = null;
@@ -294,27 +293,6 @@
 
     function buildLayers() {
         const layers = [];
-
-        // GDOP sweet-spot heatmap layer
-        if (gdopGrid && gdopGrid.length > 0) {
-            layers.push(new deck.HeatmapLayer({
-                id: 'gdop-heatmap',
-                data: gdopGrid,
-                getPosition: d => [d.lon, d.lat],
-                getWeight: d => Math.max(0.1, 10.0 / Math.max(d.gdop, 1.0)),
-                radiusPixels: 45,
-                intensity: 1.5,
-                threshold: 0.1,
-                colorRange: [
-                    [0, 0, 0, 0],
-                    [0, 100, 255, 40],
-                    [0, 200, 255, 60],
-                    [0, 255, 100, 80],
-                    [255, 255, 0, 100],
-                    [255, 100, 0, 120]
-                ]
-            }));
-        }
 
         // Trail layer — PathLayer for flight trails
         if (trailData.length > 0) {
@@ -552,14 +530,6 @@
 
     // ── Initialize ─────────────────────────────────────────────────
     map.on('load', async () => {
-        try {
-            const resp = await fetch('/api/gdop_grid');
-            const data = await resp.json();
-            gdopGrid = data.grid || [];
-        } catch(e) {
-            console.error('Failed to load GDOP grid', e);
-        }
-
         createDeckOverlay();
         connectWebSocket();
     });
