@@ -31,6 +31,28 @@ from scipy.optimize import least_squares
 from atmosphere import C_VACUUM, effective_velocity
 
 
+def _timing_residuals(
+    x: np.ndarray,
+    sensors: np.ndarray,
+    arrival_times: np.ndarray,
+    sensor_alts_m: np.ndarray,
+    aircraft_alt_m: float | None,
+    c: float = C_VACUUM,
+) -> np.ndarray:
+    N = len(sensors)
+    ranges = np.array([np.linalg.norm(x - s) for s in sensors])
+
+    if aircraft_alt_m is not None:
+        velocities = np.array([
+            effective_velocity(h_s, aircraft_alt_m) for h_s in sensor_alts_m
+        ])
+    else:
+        velocities = np.full(N, c)
+
+    t0_hat = np.mean(arrival_times - ranges / velocities)
+    return (arrival_times - t0_hat) * velocities - ranges
+
+
 def frisch_residual(
     x: np.ndarray,
     sensors: np.ndarray,
@@ -61,22 +83,14 @@ def frisch_residual(
     Returns:
         Residuals in distance units (meters), shape (N,).
     """
-    N = len(sensors)
-    ranges = np.array([np.linalg.norm(x - s) for s in sensors])
-
-    # Compute per-sensor propagation velocities using atmospheric model
-    if aircraft_alt_m is not None:
-        velocities = np.array([
-            effective_velocity(h_s, aircraft_alt_m) for h_s in sensor_alts_m
-        ])
-    else:
-        velocities = np.full(N, c)
-
-    # Analytical t0 elimination: t0_hat = mean(t_i - r_i / c_i)
-    t0_hat = np.mean(arrival_times - ranges / velocities)
-
-    # Residuals in distance units
-    residuals = (arrival_times - t0_hat) * velocities - ranges
+    residuals = _timing_residuals(
+        x,
+        sensors,
+        arrival_times,
+        sensor_alts_m,
+        aircraft_alt_m,
+        c,
+    )
 
     # Optional: altitude constraint as a pseudo-sensor
     if aircraft_alt_m is not None:
@@ -161,7 +175,16 @@ def solve_toa(
         final_residuals = frisch_residual(
             position, sensors, arrival_times, sensor_alts_m, altitude_m, track_prediction_ecef, c, prediction_weight
         )
-        residual_m = float(np.sqrt(np.mean(final_residuals ** 2)))
+        timing_residuals = _timing_residuals(
+            position,
+            sensors,
+            arrival_times,
+            sensor_alts_m,
+            altitude_m,
+            c,
+        )
+        residual_m = float(np.sqrt(np.mean(timing_residuals ** 2)))
+        objective_residual_m = float(np.sqrt(np.mean(final_residuals ** 2)))
 
         # Compute estimated transmission time
         ranges = np.array([np.linalg.norm(position - s) for s in sensors])
@@ -176,6 +199,7 @@ def solve_toa(
         return {
             "position": position,
             "residual_m": residual_m,
+            "objective_residual_m": objective_residual_m,
             "t0_s": t0_s,
             "cost": float(result.cost),
             "nfev": result.nfev,

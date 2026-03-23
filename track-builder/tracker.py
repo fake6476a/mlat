@@ -248,6 +248,7 @@ class TrackState:
             "track_quality": self.ekf.updates,
             "positions_count": len(self.positions),
             "residual_m": fix.get("residual_m", 0.0),
+            "quality_residual_m": fix.get("quality_residual_m", fix.get("residual_m", 0.0)),
             "gdop": fix.get("gdop", 0.0),
             "num_sensors": fix.get("num_sensors", 0),
             "solve_method": fix.get("solve_method", ""),
@@ -327,7 +328,7 @@ class TrackManager:
         ts = float(timestamp_s) + float(timestamp_ns) * 1e-9
 
         # R5+R8: Derive measurement noise from solver residual and GDOP
-        residual_m = fix.get("residual_m", 0.0)
+        residual_m = fix.get("quality_residual_m", fix.get("residual_m", 0.0))
         gdop = fix.get("gdop", 0.0)
         if residual_m > 0 and gdop > 0:
             meas_noise = min(2000.0, max(50.0, residual_m * gdop))
@@ -440,6 +441,7 @@ class TrackManager:
             "lon": lon,
             "alt_ft": altitude_ft,
             "residual_m": result["residual_m"],
+            "quality_residual_m": result.get("objective_residual_m", result["residual_m"]),
             "gdop": 0.0,
             "num_sensors": 2,
             "solve_method": "prediction_aided_2sensor",

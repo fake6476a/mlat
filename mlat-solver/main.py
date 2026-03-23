@@ -406,7 +406,7 @@ def _process_group(
         if cached is not None and msg_timestamp is not None:
             if not cached.is_physically_consistent(
                 aircraft_ecef, msg_timestamp,
-                new_residual_m=result.residual_m,
+                new_residual_m=result.quality_residual_m,
             ):
                 stats.groups_failed += 1
                 stats.failure_reasons["physically_inconsistent"] = stats.failure_reasons.get("physically_inconsistent", 0) + 1
@@ -421,7 +421,7 @@ def _process_group(
                 lat=result.lat, lon=result.lon,
                 alt_m=result.alt_ft * 0.3048,
                 timestamp=msg_timestamp,
-                residual_m=result.residual_m,
+                residual_m=result.quality_residual_m,
             )
 
         # Q9: Only feed solver positions back to clock cal if low residual.
@@ -431,13 +431,13 @@ def _process_group(
         # R10: Additionally require that at least one clock pair in this group
         # is already converged. This prevents early noisy solves from corrupting
         # freshly initializing pairs — only calibrated pairs get refinement.
-        if result.residual_m < 200.0 and clock_cal.has_any_calibration(receptions):
+        if result.quality_residual_m < 200.0 and clock_cal.has_any_calibration(receptions):
             clock_cal.process_adsb_reference(
                 aircraft_ecef=aircraft_ecef,
                 receptions=receptions, now=now,
             )
 
-        for rec in receptions:
+        for rec in corrected_receptions:
             s_id = rec.get("sensor_id")
             if s_id is not None:
                 s_pos = lla_to_ecef(rec["lat"], rec["lon"], rec["alt"])

@@ -50,10 +50,11 @@ MAX_GDOP_2D = 10.0  # Tighter for 2D (altitude known), horizontal-only GDOP
 
 # Maximum acceptable residual (meters)
 MAX_RESIDUAL_M = 10_000.0
-MAX_RESIDUAL_PRIOR_M = 3_000.0  # Tuned: 3000m balances solve count vs accuracy
+MAX_RESIDUAL_PRIOR_M = 200.0  # Tuned: 3000m balances solve count vs accuracy
 
 # Maximum distance from prior position for prediction-aided solves (meters)
 MAX_PRIOR_DRIFT_M = 30_000.0  # 30 km — reject if solution drifts too far from prior
+MAX_PRIOR_DRIFT_2SENSOR_M = 5_000.0
 
 # Maximum acceptable t0 offset (seconds) — should be small positive value
 MAX_T0_OFFSET_S = 1.0
@@ -68,7 +69,7 @@ class SolveResult:
     """Result of a single MLAT solve attempt."""
 
     __slots__ = (
-        "icao", "lat", "lon", "alt_ft", "residual_m", "gdop",
+        "icao", "lat", "lon", "alt_ft", "residual_m", "quality_residual_m", "gdop",
         "num_sensors", "solve_method", "timestamp_s", "timestamp_ns",
         "df_type", "squawk", "raw_msg", "t0_s",
     )
@@ -80,6 +81,7 @@ class SolveResult:
         lon: float,
         alt_ft: float,
         residual_m: float,
+        quality_residual_m: float,
         gdop: float,
         num_sensors: int,
         solve_method: str,
@@ -95,6 +97,7 @@ class SolveResult:
         self.lon = lon
         self.alt_ft = alt_ft
         self.residual_m = residual_m
+        self.quality_residual_m = quality_residual_m
         self.gdop = gdop
         self.num_sensors = num_sensors
         self.solve_method = solve_method
@@ -112,6 +115,7 @@ class SolveResult:
             "lon": round(self.lon, 6),
             "alt_ft": round(self.alt_ft, 0),
             "residual_m": round(self.residual_m, 2),
+            "quality_residual_m": round(self.quality_residual_m, 2),
             "gdop": round(self.gdop, 2),
             "num_sensors": self.num_sensors,
             "solve_method": self.solve_method,
@@ -240,7 +244,7 @@ def _solve_with_outlier_rejection(
                 sensors=sensors, arrival_times=times,
                 sensor_alts_m=alts, x0=x0,
                 altitude_m=altitude_m,
-                track_prediction_ecef=position_prior_ecef,
+                track_prediction_ecef=None,
                 prediction_weight=pw,
             )
             if result is not None and method in ("centroid_init", "prior_aided", "grid_search"):
@@ -409,7 +413,7 @@ def solve_group(
                 sensor_alts_m=sensor_alts_m,
                 x0=x0,
                 altitude_m=altitude_m,
-                track_prediction_ecef=position_prior_ecef,
+                track_prediction_ecef=None,
                 prediction_weight=pw,
             )
             if result is not None and solve_method in ("centroid_init", "prior_aided", "grid_search"):
@@ -422,6 +426,13 @@ def solve_group(
 
     position = result["position"]
     residual_m = result["residual_m"]
+    prior_offset_m = 0.0
+    if position_prior_ecef is not None:
+        prior_offset_m = float(np.linalg.norm(position - position_prior_ecef))
+    if n_sensors == 2 and position_prior_ecef is not None:
+        quality_residual_m = max(residual_m, prior_offset_m)
+    else:
+        quality_residual_m = residual_m
     t0_s = result["t0_s"]
 
     # Step 3: Validation
@@ -445,8 +456,8 @@ def solve_group(
 
     # 3b2. Prior drift check — prediction-aided solutions must stay near the prior
     if position_prior_ecef is not None and n_sensors <= 3:
-        drift = np.linalg.norm(position - position_prior_ecef)
-        if drift > MAX_PRIOR_DRIFT_M:
+        max_prior_drift = MAX_PRIOR_DRIFT_2SENSOR_M if n_sensors == 2 else MAX_PRIOR_DRIFT_M
+        if prior_offset_m > max_prior_drift:
             return None, "prior_drift_exceeded"
 
     # 3c. GDOP computation (Part 4.3)
@@ -478,6 +489,7 @@ def solve_group(
         lon=lon,
         alt_ft=final_alt_ft,
         residual_m=residual_m,
+        quality_residual_m=quality_residual_m,
         gdop=gdop,
         num_sensors=n_used,
         solve_method=solve_method,

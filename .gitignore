@@ -37,7 +37,8 @@ Thumbs.db
 wg0.conf
 
 # MLAT Data & Logs
-*.jsonl
+*.json
 *.log
 location-overrides.txt
 data-pipe/mlat-pipe
+solved.jsonl
