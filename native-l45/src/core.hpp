@@ -501,6 +501,7 @@ class TrackManager {
   int fixes_received = 0;
   int fixes_accepted = 0;
   int fixes_rejected = 0;
+  int rejected_quality_2sensor = 0;
   int tracks_created = 0;
   int tracks_pruned = 0;
 };

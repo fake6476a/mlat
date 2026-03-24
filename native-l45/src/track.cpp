@@ -23,6 +23,7 @@ constexpr double kMpsToKts = 1.9438444924406;
 constexpr double kMpsToFpm = 196.85039370079;
 constexpr double kStatsInterval = 30.0;
 constexpr double kPruneInterval = 60.0;
+constexpr double kMax2SensorQualityResidualM = 50.0;
 
 double monotonic_now() {
   using clock = std::chrono::steady_clock;
@@ -437,6 +438,11 @@ std::optional<TrackOutput> TrackManager::process_fix(const SolveFix& fix) {
   if (fix.icao.empty()) {
     return std::nullopt;
   }
+  if (fix.num_sensors == 2 && fix.quality_residual_m > kMax2SensorQualityResidualM) {
+    ++fixes_rejected;
+    ++rejected_quality_2sensor;
+    return std::nullopt;
+  }
   double alt_m = ft_to_m(fix.alt_ft);
   Vec3 position_ecef = lla_to_ecef(fix.lat, fix.lon, alt_m);
   double ts = static_cast<double>(fix.timestamp_s) + static_cast<double>(fix.timestamp_ns) * 1e-9;
@@ -584,6 +590,7 @@ std::string TrackManager::stats_json() const {
   os << "\"fixes_received\":" << fixes_received;
   os << ",\"fixes_accepted\":" << fixes_accepted;
   os << ",\"fixes_rejected\":" << fixes_rejected;
+  os << ",\"rejected_quality_2sensor\":" << rejected_quality_2sensor;
   os << ",\"tracks_created\":" << tracks_created;
   os << ",\"tracks_pruned\":" << tracks_pruned;
   os << ",\"active_tracks\":" << tracks_.size();
