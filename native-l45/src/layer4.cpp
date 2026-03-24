@@ -12,6 +12,8 @@ namespace native_l45 {
 namespace {
 
 constexpr double kMaxPairVarianceUs2 = 50.0;
+constexpr int kDefaultUncertainDelegateMinSolves = 20;
+constexpr double kDefaultUncertainDelegateQualityResidualM = 200.0;
 
 double monotonic_now() {
   using clock = std::chrono::steady_clock;

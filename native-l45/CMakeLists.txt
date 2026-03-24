@@ -88,6 +88,7 @@ target_compile_options(native_l45_layer5 PRIVATE
   -Wall
   -Wextra
   -Wpedantic
+  ${NATIVE_L45_PGO_COMPILE_FLAGS}
 )
 
 target_link_libraries(native_l45_layer4 PUBLIC native_l45_common)
@@ -103,6 +104,7 @@ add_executable(mlat-solver-native src/layer4_main.cpp)
 add_executable(track-builder-native src/layer5_main.cpp)
 
 target_compile_options(mlat-solver-native PRIVATE ${NATIVE_L45_PGO_COMPILE_FLAGS})
+target_compile_options(track-builder-native PRIVATE ${NATIVE_L45_PGO_COMPILE_FLAGS})
 
 target_link_libraries(mlat-solver-native PRIVATE native_l45_layer4)
 target_link_libraries(track-builder-native PRIVATE native_l45_layer5)

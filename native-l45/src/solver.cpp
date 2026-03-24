@@ -446,7 +446,7 @@ OutlierSolveResult solve_with_outlier_rejection(
     double pw = cur_n == 2 ? 8.0 : 3.0;
     std::optional<ToaResult> result;
     if (cur_n == 2 && altitude_m && position_prior_ecef) {
-      result = solve_toa(sensors, times, alts, *x0, altitude_m, position_prior_ecef, 1000, pw);
+      result = solve_toa(sensors, times, alts, *x0, altitude_m, position_prior_ecef, 100, pw);
       if (result) {
         method = "prior_2sensor";
       }
@@ -667,6 +667,8 @@ Vec3 centroid_init(const std::vector<Vec3>& sensors, std::optional<double> altit
   return centroid;
 }
 
+constexpr int kPrior2SensorMaxNfev = 50;
+
 std::optional<ToaResult> solve_toa(
     const std::vector<Vec3>& sensors,
     const std::vector<double>& arrival_times,
@@ -773,14 +775,14 @@ SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position
     if (!x0) {
       x0 = centroid_init(sensor_positions, altitude_m);
       solve_method = "centroid_init";
-    }
-    double pw = n_sensors == 2 ? 8.0 : 3.0;
-    if (n_sensors == 2 && altitude_m && position_prior_ecef) {
-      result = solve_toa(sensor_positions, arrival_times, sensor_alts_m, *x0, altitude_m, position_prior_ecef, 1000, pw);
-      if (result) {
-        solve_method = "prior_2sensor";
-      }
-    } else if (n_sensors == 3 && altitude_m) {
+     }
+     double pw = n_sensors == 2 ? 8.0 : 3.0;
+     if (n_sensors == 2 && altitude_m && position_prior_ecef) {
+       result = solve_toa(sensor_positions, arrival_times, sensor_alts_m, *x0, altitude_m, position_prior_ecef, kPrior2SensorMaxNfev, pw);
+       if (result) {
+         solve_method = "prior_2sensor";
+       }
+     } else if (n_sensors == 3 && altitude_m) {
       result = solve_constrained_3sensor(sensor_positions, arrival_times, sensor_alts_m, *altitude_m, *x0);
       if (result && (solve_method == "centroid_init" || solve_method == "prior_aided" || solve_method == "grid_search")) {
         solve_method = "constrained_3sensor";
