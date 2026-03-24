@@ -1,3 +1,8 @@
+// solver.cpp — Layer 4 MLAT position solver.
+// Solves aircraft positions from Time-of-Arrival (TOA) measurements using
+// Levenberg-Marquardt optimization with Soft-L1 robust cost. Supports
+// algebraic initialization (Inamdar), outlier rejection, altitude constraints,
+// prior-aided 2-sensor solving, GDOP filtering, and clock calibration.
 #include "core.hpp"
 
 #include <algorithm>
@@ -11,18 +16,20 @@ namespace native_l45 {
 
 namespace {
 
+// --- Quality thresholds ---
 constexpr double kMaxRangeM = 500000.0;
-constexpr double kMaxGdop = 20.0;
-constexpr double kMaxGdop2d = 10.0;
-constexpr double kMaxResidualM = 10000.0;
-constexpr double kMaxResidualPriorM = 200.0;
-constexpr double kMaxPriorDriftM = 30000.0;
-constexpr double kMaxPriorDrift2SensorM = 5000.0;
-constexpr int kMinSensorsNoAlt = 4;
-constexpr int kMinSensorsWithAlt = 3;
-constexpr int kMinSensorsWithPrior = 2;
-constexpr double kOutlierSensorThresholdM = 3000.0;
+constexpr double kMaxGdop = 20.0;                   // 3D GDOP cap (>=4 sensors)
+constexpr double kMaxGdop2d = 10.0;                  // 2D GDOP cap (2-3 sensors)
+constexpr double kMaxResidualM = 10000.0;            // general residual cap
+constexpr double kMaxResidualPriorM = 200.0;         // residual cap for prior-aided solves
+constexpr double kMaxPriorDriftM = 30000.0;          // max drift from prior (3+ sensors)
+constexpr double kMaxPriorDrift2SensorM = 5000.0;    // max drift from prior (2 sensors)
+constexpr int kMinSensorsNoAlt = 4;                  // min sensors without altitude
+constexpr int kMinSensorsWithAlt = 3;                // min sensors with barometric alt
+constexpr int kMinSensorsWithPrior = 2;              // min sensors with position prior
+constexpr double kOutlierSensorThresholdM = 3000.0;  // per-sensor outlier rejection threshold
 
+// Gaussian elimination with partial pivoting to solve Ax = b.
 template <std::size_t N>
 bool solve_linear(std::array<std::array<double, N>, N> a, std::array<double, N> b, std::array<double, N>& x) {
   for (std::size_t col = 0; col < N; ++col) {
@@ -66,6 +73,7 @@ bool solve_linear(std::array<std::array<double, N>, N> a, std::array<double, N> 
   return true;
 }
 
+// Gauss-Jordan matrix inversion with partial pivoting.
 template <std::size_t N>
 bool invert_matrix(std::array<std::array<double, N>, N> a, std::array<std::array<double, N>, N>& inv) {
   for (std::size_t i = 0; i < N; ++i) {
@@ -112,6 +120,7 @@ bool invert_matrix(std::array<std::array<double, N>, N> a, std::array<std::array
   return true;
 }
 
+// Compute effective signal velocity per sensor, accounting for atmospheric refraction.
 std::vector<double> compute_velocities(const std::vector<double>& sensor_alts_m, const std::optional<double>& aircraft_alt_m) {
   std::vector<double> velocities(sensor_alts_m.size(), kVacuumC);
   if (!aircraft_alt_m) {
@@ -123,11 +132,12 @@ std::vector<double> compute_velocities(const std::vector<double>& sensor_alts_m,
   return velocities;
 }
 
+// Intermediate state for TOA residual computation.
 struct TimingState {
-  std::vector<double> residuals;
-  std::vector<double> ranges;
-  std::vector<Vec3> units;
-  double t0_hat = 0.0;
+  std::vector<double> residuals;   // per-sensor timing residuals (metres)
+  std::vector<double> ranges;      // distance from candidate to each sensor
+  std::vector<Vec3> units;         // unit vectors from sensor to candidate
+  double t0_hat = 0.0;             // estimated emission time (Frisch elimination)
 
   void resize(std::size_t n) {
     residuals.resize(n);
@@ -136,6 +146,8 @@ struct TimingState {
   }
 };
 
+// Compute timing residuals using Frisch-style t0 elimination.
+// For each sensor: residual = (arrival_time - t0_hat) * velocity - range.
 void timing_state_core(
     const Vec3& x,
     const std::vector<Vec3>& sensors,
@@ -163,6 +175,7 @@ void timing_state_core(
   }
 }
 
+// Jacobian of timing residuals w.r.t. position (3 columns per sensor row).
 void timing_jacobian_core(
     const std::vector<Vec3>& units,
     const std::vector<double>& velocities,
@@ -180,11 +193,13 @@ void timing_jacobian_core(
   }
 }
 
+// Altitude constraint: penalises deviation from barometric altitude.
 struct AltitudeConstraintEval {
   double residual = 0.0;
   std::array<double, 3> gradient{};
 };
 
+// Evaluate altitude constraint residual (and optionally gradient).
 AltitudeConstraintEval evaluate_altitude_constraint(const Vec3& x, double aircraft_alt_m, bool with_gradient) {
   auto [lat, lon, alt] = ecef_to_lla(x.x, x.y, x.z);
   AltitudeConstraintEval eval;
@@ -203,10 +218,11 @@ AltitudeConstraintEval evaluate_altitude_constraint(const Vec3& x, double aircra
   return eval;
 }
 
+// Full objective evaluation: timing residuals + altitude constraint + prediction prior.
 struct ObjectiveEval {
-  std::vector<double> objective_residuals;
-  std::vector<std::array<double, 3>> jacobian;
-  std::vector<double> timing_residuals;
+  std::vector<double> objective_residuals;          // all residual terms
+  std::vector<std::array<double, 3>> jacobian;     // Jacobian rows
+  std::vector<double> timing_residuals;            // timing-only residuals
   double t0_hat = 0.0;
 
   void reserve(std::size_t sensor_count, bool has_altitude, bool has_prediction) {
@@ -217,6 +233,7 @@ struct ObjectiveEval {
   }
 };
 
+// Build the full objective: timing residuals + optional altitude + optional prediction prior.
 void evaluate_objective(
     const Vec3& x,
     const std::vector<Vec3>& sensors,
@@ -257,6 +274,7 @@ void evaluate_objective(
   }
 }
 
+// Soft-L1 (pseudo-Huber) cost: robust to outlier residuals.
 double soft_l1_cost(const std::vector<double>& residuals, double f_scale = 500.0) {
   double total = 0.0;
   for (double r : residuals) {
@@ -266,11 +284,14 @@ double soft_l1_cost(const std::vector<double>& residuals, double f_scale = 500.0
   return total;
 }
 
+// Per-row weight for IRLS (iteratively reweighted least squares) under Soft-L1.
 double soft_l1_row_scale(double residual, double f_scale = 500.0) {
   double z = (residual / f_scale) * (residual / f_scale);
   return std::sqrt(1.0 / std::sqrt(1.0 + z));
 }
 
+// Core Levenberg-Marquardt TOA solver.
+// Minimises Soft-L1 cost over position (3 unknowns), with t0 analytically eliminated.
 std::optional<ToaResult> solve_toa_impl(
     const std::vector<Vec3>& sensors,
     const std::vector<double>& arrival_times,
@@ -373,6 +394,7 @@ std::optional<ToaResult> solve_toa_impl(
   return result;
 }
 
+// Evaluate per-sensor timing residuals without Jacobian (used for outlier detection).
 std::vector<double> timing_residuals_only(
     const Vec3& x,
     const std::vector<Vec3>& sensors,
@@ -385,6 +407,7 @@ std::vector<double> timing_residuals_only(
   return state.residuals;
 }
 
+// Result of solving with iterative outlier rejection.
 struct OutlierSolveResult {
   std::optional<ToaResult> result;
   std::vector<Vec3> used_sensors;
@@ -393,6 +416,7 @@ struct OutlierSolveResult {
   std::string solve_method;
 };
 
+// Iteratively solve and remove the worst-residual sensor until all are below threshold.
 OutlierSolveResult solve_with_outlier_rejection(
     const std::vector<Vec3>& sensor_positions,
     const std::vector<double>& arrival_times,
@@ -491,6 +515,7 @@ OutlierSolveResult solve_with_outlier_rejection(
 
 }  // namespace
 
+// 3D Geometric Dilution of Precision from (H^T H)^{-1} trace.
 double compute_gdop(const Vec3& aircraft_pos, const std::vector<Vec3>& sensor_positions) {
   if (sensor_positions.size() < 3) {
     return std::numeric_limits<double>::infinity();
@@ -520,6 +545,7 @@ double compute_gdop(const Vec3& aircraft_pos, const std::vector<Vec3>& sensor_po
   return std::sqrt(trace_val);
 }
 
+// 2D GDOP projected onto local East-North plane (for 2-3 sensor solves).
 double compute_gdop_2d(const Vec3& aircraft_pos, const std::vector<Vec3>& sensor_positions) {
   if (sensor_positions.size() < 2) {
     return std::numeric_limits<double>::infinity();
@@ -563,6 +589,8 @@ double compute_gdop_2d(const Vec3& aircraft_pos, const std::vector<Vec3>& sensor
   return std::sqrt(trace_val);
 }
 
+// Inamdar algebraic closed-form initialiser for >=5 sensors.
+// Eliminates range variable using TDOA ratios to produce a 3x3 linear system.
 std::optional<Vec3> inamdar_5sensor(const std::vector<Vec3>& sensors, const std::vector<double>& arrival_times) {
   if (sensors.size() < 5 || sensors.size() != arrival_times.size()) {
     return std::nullopt;
@@ -604,6 +632,8 @@ std::optional<Vec3> inamdar_5sensor(const std::vector<Vec3>& sensors, const std:
   return position;
 }
 
+// Inamdar initialiser for 4 sensors with altitude constraint.
+// Solves least-squares 3x3 system then snaps result to barometric altitude.
 std::optional<Vec3> inamdar_4sensor_altitude(const std::vector<Vec3>& sensors, const std::vector<double>& arrival_times, double altitude_m) {
   if (sensors.size() < 4 || sensors.size() != arrival_times.size()) {
     return std::nullopt;
@@ -660,6 +690,7 @@ std::optional<Vec3> inamdar_4sensor_altitude(const std::vector<Vec3>& sensors, c
   return position;
 }
 
+// Fallback initialiser: sensor centroid, optionally snapped to altitude.
 Vec3 centroid_init(const std::vector<Vec3>& sensors, std::optional<double> altitude_m) {
   Vec3 centroid{};
   for (const auto& sensor : sensors) {
@@ -674,8 +705,9 @@ Vec3 centroid_init(const std::vector<Vec3>& sensors, std::optional<double> altit
   return centroid;
 }
 
-constexpr int kPrior2SensorMaxNfev = 50;
+constexpr int kPrior2SensorMaxNfev = 50;  // LM iteration cap for prior-aided 2-sensor
 
+// Public wrapper: catches exceptions from the LM solver.
 std::optional<ToaResult> solve_toa(
     const std::vector<Vec3>& sensors,
     const std::vector<double>& arrival_times,
@@ -692,6 +724,7 @@ std::optional<ToaResult> solve_toa(
   }
 }
 
+// 3-sensor solve with barometric altitude constraint.
 std::optional<ToaResult> solve_constrained_3sensor(
     const std::vector<Vec3>& sensors,
     const std::vector<double>& arrival_times,
@@ -701,6 +734,8 @@ std::optional<ToaResult> solve_constrained_3sensor(
   return solve_toa(sensors, arrival_times, sensor_alts_m, x0, altitude_m, std::nullopt, 50, 8.0);
 }
 
+// Top-level group solver: selects method based on sensor count and available priors,
+// runs the solver, applies quality checks (residual, GDOP, range, prior drift).
 SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position_prior_ecef, double prior_uncertainty_m) {
   SolveOutcome outcome;
   int n_sensors = static_cast<int>(group.receptions.size());

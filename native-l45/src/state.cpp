@@ -1,3 +1,6 @@
+// state.cpp — Runtime state management for Layer 4.
+// Sensor location overrides, position cache with velocity prediction,
+// clock calibration (Kalman filter per sensor pair), and solve statistics.
 #include "core.hpp"
 
 #include <algorithm>
@@ -11,22 +14,26 @@ namespace native_l45 {
 
 namespace {
 
-constexpr double kOverrideMatchThresholdDeg = 0.5;
-constexpr double kMaxCacheAge = 120.0;
-constexpr std::size_t kMaxCacheSize = 5000;
-constexpr double kMaxAircraftSpeedMps = 1030.0;
-constexpr double kMaxAircraftAccelMps2 = 50.0;
-constexpr int kMinSyncPoints = 3;
-constexpr double kOutlierSigma = 3.5;
-constexpr int kMaxConsecutiveOutliers = 5;
-constexpr double kMaxClockOffset = 0.5;
-constexpr double kClockR = 25e-12;
-constexpr double kClockQDrift = 1e-18;
+// --- Configuration constants ---
+constexpr double kOverrideMatchThresholdDeg = 0.5;  // max distance to match override to sensor
+constexpr double kMaxCacheAge = 120.0;             // max age of cached position (s)
+constexpr std::size_t kMaxCacheSize = 5000;         // max cached aircraft before pruning
+constexpr double kMaxAircraftSpeedMps = 1030.0;     // physical consistency speed limit (m/s)
+constexpr double kMaxAircraftAccelMps2 = 50.0;      // physical consistency accel limit (m/s²)
+constexpr int kMinSyncPoints = 3;                   // min observations before clock pair is valid
+constexpr double kOutlierSigma = 3.5;               // clock outlier rejection threshold (sigma)
+constexpr int kMaxConsecutiveOutliers = 5;           // consecutive outliers before clock reset
+constexpr double kMaxClockOffset = 0.5;              // max allowed clock correction (s)
+constexpr double kClockR = 25e-12;                   // measurement noise variance (s²)
+constexpr double kClockQDrift = 1e-18;               // process noise for clock drift
 
 }  // namespace
 
+// --- Sensor Override Map ---
+
 SensorOverrideMap::SensorOverrideMap(std::vector<OverrideEntry> overrides) : overrides_(std::move(overrides)) {}
 
+// Match a sensor ID to a known override by finding the closest override within threshold.
 const OverrideEntry* SensorOverrideMap::lookup(std::int64_t sensor_id, double stream_lat, double stream_lon) {
   auto it = sensor_map_.find(sensor_id);
   if (it != sensor_map_.end()) {
@@ -77,6 +84,7 @@ std::string SensorOverrideMap::stats_json() const {
   return os.str();
 }
 
+// Load sensor location overrides from JSON file (searches several candidate paths).
 std::optional<SensorOverrideMap> load_location_overrides() {
   std::vector<std::filesystem::path> candidates = {
       std::filesystem::current_path() / "data-pipe" / "location-overrides.txt",
@@ -125,6 +133,7 @@ std::optional<SensorOverrideMap> load_location_overrides() {
   return std::nullopt;
 }
 
+// Replace stream-reported sensor positions with known surveyed positions.
 std::vector<Reception> apply_overrides(const std::vector<Reception>& receptions, SensorOverrideMap& override_map) {
   std::vector<Reception> corrected;
   corrected.reserve(receptions.size());
@@ -143,6 +152,9 @@ std::vector<Reception> apply_overrides(const std::vector<Reception>& receptions,
   return corrected;
 }
 
+// --- Position Cache ---
+
+// Linear extrapolation of cached position using velocity (up to 60s).
 Vec3 CachedPosition::predict(double target_timestamp) const {
   double dt = target_timestamp - timestamp;
   if (velocity_ecef && dt > 0.0 && dt < 60.0) {
@@ -151,6 +163,7 @@ Vec3 CachedPosition::predict(double target_timestamp) const {
   return ecef;
 }
 
+// Check if a new position is physically reachable (speed + acceleration limits).
 bool CachedPosition::is_physically_consistent(const Vec3& new_ecef, double new_timestamp, double new_residual_m) const {
   double dt = std::abs(new_timestamp - timestamp);
   if (dt < 0.001) {
@@ -177,6 +190,7 @@ bool CachedPosition::is_physically_consistent(const Vec3& new_ecef, double new_t
   return true;
 }
 
+// Retrieve cached position for an ICAO (returns nullopt if expired or missing).
 std::optional<CachedPosition> PositionCache::get(const std::string& icao, std::optional<double> target_timestamp) {
   auto it = cache_.find(icao);
   if (it == cache_.end()) {
@@ -194,6 +208,7 @@ std::optional<CachedPosition> PositionCache::get(const std::string& icao, std::o
   return it->second;
 }
 
+// Store or update position for an ICAO. Derives velocity from consecutive solves.
 void PositionCache::put(const std::string& icao, const Vec3& ecef, double lat, double lon, double alt_m, double timestamp, double residual_m) {
   std::optional<Vec3> velocity;
   int solve_count = 1;
@@ -221,6 +236,7 @@ void PositionCache::put(const std::string& icao, const Vec3& ecef, double lat, d
   }
 }
 
+// Inject ADS-B decoded velocity into the cache (ENU to ECEF rotation).
 void PositionCache::update_velocity_from_adsb(const std::string& icao, double ew_mps, double ns_mps, double vrate_mps, double timestamp) {
   auto it = cache_.find(icao);
   if (it == cache_.end()) {
@@ -240,6 +256,7 @@ void PositionCache::update_velocity_from_adsb(const std::string& icao, double ew
   it->second.last_order = static_cast<double>(++order_counter_);
 }
 
+// Evict the oldest 50% of entries when cache exceeds kMaxCacheSize.
 void PositionCache::prune() {
   std::vector<std::pair<std::string, double>> entries;
   entries.reserve(cache_.size());
@@ -277,8 +294,12 @@ std::size_t PositionCache::size() const {
   return cache_.size();
 }
 
+// --- Clock Calibration ---
+
 ClockPairing::ClockPairing(std::int64_t sensor_a_, std::int64_t sensor_b_) : sensor_a(sensor_a_), sensor_b(sensor_b_) {}
 
+// Kalman filter update for a clock pair: predict offset+drift, then assimilate new measurement.
+// Rejects outliers and resets after kMaxConsecutiveOutliers consecutive rejections.
 bool ClockPairing::update(double measured_offset, double now) {
   double dt = last_update > 0.0 ? now - last_update : 0.0;
   if (n == 0) {
@@ -342,6 +363,7 @@ bool ClockPairing::update(double measured_offset, double now) {
   return true;
 }
 
+// Predict current clock offset at time 'now' using offset + drift*dt.
 double ClockPairing::predict(double now) const {
   if (!valid) {
     return offset;
@@ -350,6 +372,7 @@ double ClockPairing::predict(double now) const {
   return offset + drift * dt;
 }
 
+// Pack two sensor IDs into a single 64-bit key (order-independent).
 std::uint64_t ClockCalibrator::pair_key(std::int64_t a, std::int64_t b) {
   std::uint64_t lo = static_cast<std::uint64_t>(std::min(a, b));
   std::uint64_t hi = static_cast<std::uint64_t>(std::max(a, b));
@@ -365,6 +388,8 @@ ClockPairing& ClockCalibrator::get_pairing(std::int64_t a, std::int64_t b) {
   return it->second;
 }
 
+// Train clock calibration from an ADS-B reference: compute range-corrected
+// arrival times, then update pairwise Kalman filters for all sensor pairs.
 void ClockCalibrator::process_adsb_reference(const Vec3& aircraft_ecef, const std::vector<Reception>& receptions, double now) {
   int n = static_cast<int>(receptions.size());
   if (n < 2) {
@@ -401,6 +426,9 @@ void ClockCalibrator::process_adsb_reference(const Vec3& aircraft_ecef, const st
   }
 }
 
+// Apply clock corrections to a group's reception timestamps.
+// Builds a minimum-variance spanning tree from the reference sensor (most edges)
+// and propagates corrections along the tree to each sensor.
 std::vector<Reception> ClockCalibrator::correct_timestamps(const std::vector<Reception>& receptions, double now) {
   if (receptions.size() < 2) {
     return receptions;
@@ -484,6 +512,7 @@ std::vector<Reception> ClockCalibrator::correct_timestamps(const std::vector<Rec
   return corrected;
 }
 
+// Check if any sensor pair in this group has a valid clock calibration.
 bool ClockCalibrator::has_any_calibration(const std::vector<Reception>& receptions) const {
   for (std::size_t i = 0; i < receptions.size(); ++i) {
     for (std::size_t j = i + 1; j < receptions.size(); ++j) {
@@ -534,12 +563,16 @@ std::string ClockCalibrator::stats_json() const {
   return os.str();
 }
 
+// --- Layer 4 Statistics ---
+
+// Record a successful solve (method name + residual).
 void Layer4Stats::record_solve(const std::string& method, double residual_m) {
   ++groups_solved;
   ++method_counts[method];
   residuals.push_back(residual_m);
 }
 
+// Track per-sensor residuals (rolling window of last 100 values per sensor).
 void Layer4Stats::record_sensor_residual(std::int64_t sensor_id, double residual_m) {
   auto& values = sensor_residuals_m[sensor_id];
   values.push_back(residual_m);
@@ -548,6 +581,7 @@ void Layer4Stats::record_sensor_residual(std::int64_t sensor_id, double residual
   }
 }
 
+// Serialise all L4 stats to a JSON string (for stderr logging).
 std::string Layer4Stats::to_json() const {
   std::ostringstream os;
   os << '{';

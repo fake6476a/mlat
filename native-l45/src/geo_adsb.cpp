@@ -1,3 +1,6 @@
+// geo_adsb.cpp — Geodetic utilities and ADS-B message decoding.
+// WGS84 coordinate conversions (LLA <-> ECEF), atmospheric refraction model,
+// ADS-B DF17 position (CPR) and velocity extraction, and CPR global/local decode.
 #include "core.hpp"
 
 #include <bit>
@@ -10,16 +13,22 @@ namespace native_l45 {
 
 namespace {
 
-constexpr double kWgs84A = 6378137.0;
-constexpr double kWgs84F = 1.0 / 298.257223563;
-constexpr double kWgs84B = kWgs84A * (1.0 - kWgs84F);
-constexpr double kWgs84E2 = 1.0 - (kWgs84B / kWgs84A) * (kWgs84B / kWgs84A);
-constexpr double kWgs84Ep2 = (kWgs84A * kWgs84A - kWgs84B * kWgs84B) / (kWgs84B * kWgs84B);
-constexpr double kA0 = 315e-6;
-constexpr double kB = 0.1361e-3;
-constexpr double kCprPairWindow = 10.0;
-constexpr int kNz = 15;
+// --- WGS84 ellipsoid parameters ---
+constexpr double kWgs84A = 6378137.0;                    // semi-major axis (m)
+constexpr double kWgs84F = 1.0 / 298.257223563;         // flattening
+constexpr double kWgs84B = kWgs84A * (1.0 - kWgs84F);   // semi-minor axis (m)
+constexpr double kWgs84E2 = 1.0 - (kWgs84B / kWgs84A) * (kWgs84B / kWgs84A);   // first eccentricity squared
+constexpr double kWgs84Ep2 = (kWgs84A * kWgs84A - kWgs84B * kWgs84B) / (kWgs84B * kWgs84B); // second eccentricity squared
 
+// --- Atmospheric refraction model constants ---
+constexpr double kA0 = 315e-6;         // refractivity at sea level
+constexpr double kB = 0.1361e-3;       // exponential decay rate (1/m)
+
+// --- CPR decoding constants ---
+constexpr double kCprPairWindow = 10.0; // max time between even/odd frames (s)
+constexpr int kNz = 15;                 // number of latitude zones
+
+// Cache key for sensor ECEF lookup (bit-exact match on LLA coordinates).
 struct SensorEcefKey {
   std::uint64_t lat_bits = 0;
   std::uint64_t lon_bits = 0;
@@ -28,6 +37,7 @@ struct SensorEcefKey {
   bool operator==(const SensorEcefKey& other) const = default;
 };
 
+// Hash combining lat/lon/alt bit patterns (boost-style hash combine).
 struct SensorEcefKeyHash {
   std::size_t operator()(const SensorEcefKey& key) const {
     std::size_t h = static_cast<std::size_t>(key.lat_bits);
@@ -37,6 +47,7 @@ struct SensorEcefKeyHash {
   }
 };
 
+// Build a cache key from sensor coordinates by bit-casting doubles to uint64.
 SensorEcefKey make_sensor_ecef_key(double lat_deg, double lon_deg, double alt_m) {
   return {
       std::bit_cast<std::uint64_t>(lat_deg),
@@ -45,6 +56,7 @@ SensorEcefKey make_sensor_ecef_key(double lat_deg, double lon_deg, double alt_m)
   };
 }
 
+// Convert a single hex character to its 4-bit value.
 int hex_nibble(char c) {
   if (c >= '0' && c <= '9') return c - '0';
   if (c >= 'a' && c <= 'f') return 10 + c - 'a';
@@ -52,10 +64,12 @@ int hex_nibble(char c) {
   return -1;
 }
 
+// Positive modulo (always returns [0, modulus)).
 double positive_mod(double value, double modulus) {
   return value - modulus * std::floor(value / modulus);
 }
 
+// Parse a hex string into raw bytes.
 bool hex_bytes(std::string_view hex, std::uint8_t* out, std::size_t count) {
   if (hex.size() != count * 2) {
     return false;
@@ -71,6 +85,7 @@ bool hex_bytes(std::string_view hex, std::uint8_t* out, std::size_t count) {
   return true;
 }
 
+// Decode Mode-S altitude code (Q-bit encoding) to feet.
 std::optional<int> decode_altitude(int alt_code) {
   int q_bit = (alt_code >> 4) & 1;
   if (q_bit != 1) {
@@ -84,6 +99,7 @@ std::optional<int> decode_altitude(int alt_code) {
   return alt_ft;
 }
 
+// CPR NL function: number of longitude zones for a given latitude.
 double cpr_nl(double lat) {
   if (std::abs(lat) >= 87.0) {
     return 1.0;
@@ -99,6 +115,7 @@ double cpr_nl(double lat) {
   }
 }
 
+// CPR global decode: requires both even and odd frames to compute unambiguous position.
 std::optional<std::pair<double, double>> cpr_global_decode(
     int lat_cpr_even,
     int lon_cpr_even,
@@ -153,6 +170,7 @@ std::optional<std::pair<double, double>> cpr_global_decode(
   return std::make_pair(lat, lon);
 }
 
+// CPR local decode: uses a nearby reference position to resolve a single frame.
 std::optional<std::pair<double, double>> cpr_local_decode(
     int lat_cpr,
     int lon_cpr,
@@ -186,6 +204,7 @@ std::optional<std::pair<double, double>> cpr_local_decode(
 
 }  // namespace
 
+// Convert geodetic LLA (lat/lon in degrees, alt in metres) to ECEF XYZ.
 Vec3 lla_to_ecef(double lat_deg, double lon_deg, double alt_m) {
   double lat = lat_deg * M_PI / 180.0;
   double lon = lon_deg * M_PI / 180.0;
@@ -201,6 +220,7 @@ Vec3 lla_to_ecef(double lat_deg, double lon_deg, double alt_m) {
   };
 }
 
+// Cached version of lla_to_ecef for sensor positions (avoids repeated trig).
 Vec3 sensor_lla_to_ecef(double lat_deg, double lon_deg, double alt_m) {
   static std::unordered_map<SensorEcefKey, Vec3, SensorEcefKeyHash> cache = []() {
     std::unordered_map<SensorEcefKey, Vec3, SensorEcefKeyHash> map;
@@ -217,6 +237,7 @@ Vec3 sensor_lla_to_ecef(double lat_deg, double lon_deg, double alt_m) {
   return value;
 }
 
+// Convert ECEF XYZ to geodetic LLA using Bowring's iterative method.
 std::tuple<double, double, double> ecef_to_lla(double x, double y, double z) {
   double lon = std::atan2(y, x);
   double p = std::hypot(x, y);
@@ -244,6 +265,8 @@ double m_to_ft(double meters) {
   return meters / 0.3048;
 }
 
+// Compute effective signal propagation velocity between sensor and aircraft altitudes,
+// accounting for atmospheric refraction via exponential atmosphere model.
 double effective_velocity(double h_sensor, double h_aircraft) {
   double dh = h_aircraft - h_sensor;
   if (std::abs(dh) < 1.0) {
@@ -253,6 +276,7 @@ double effective_velocity(double h_sensor, double h_aircraft) {
   return kVacuumC / (1.0 + correction);
 }
 
+// Extract CPR position fields (lat_cpr, lon_cpr, f_bit, altitude) from a DF17 hex message.
 std::optional<CPRFrame> extract_df17_position_fields(const std::string& raw_msg) {
   if (raw_msg.size() != 28) {
     return std::nullopt;
@@ -285,6 +309,7 @@ std::optional<CPRFrame> extract_df17_position_fields(const std::string& raw_msg)
   return frame;
 }
 
+// Extract airborne velocity (ground speed, heading, vertical rate) from a DF17 hex message.
 std::optional<DecodedVelocity> extract_df17_velocity(const std::string& raw_msg) {
   if (raw_msg.size() != 28) {
     return std::nullopt;
@@ -336,11 +361,13 @@ std::optional<DecodedVelocity> extract_df17_velocity(const std::string& raw_msg)
   return DecodedVelocity{ew_knots, ns_knots, speed, heading, vrate_fpm};
 }
 
+// Convert a decoded ADS-B position to ECEF (default 10 km altitude if missing).
 Vec3 position_to_ecef(double lat, double lon, const std::optional<int>& alt_ft) {
   double alt_m = alt_ft ? ft_to_m(static_cast<double>(*alt_ft)) : 10000.0;
   return lla_to_ecef(lat, lon, alt_m);
 }
 
+// Add a CPR frame for an ICAO: try global decode first, fall back to local decode.
 std::optional<ADSBPosition> CPRBuffer::add_frame(const std::string& icao, const CPRFrame& frame) {
   ++frames_received;
   auto& pair = frames_[icao];

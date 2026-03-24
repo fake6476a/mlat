@@ -1,3 +1,8 @@
+// track.cpp — Layer 5 EKF-based track builder.
+// Maintains per-aircraft tracks using a 6-state constant-velocity Extended
+// Kalman Filter [x,y,z,vx,vy,vz] in ECEF. Applies Chi-squared gating,
+// adaptive measurement noise, 2-sensor quality filtering, prediction-aided
+// solving for unsolved L4 groups, and periodic stale track pruning.
 #include "core.hpp"
 
 #include <algorithm>
@@ -12,24 +17,27 @@ namespace native_l45 {
 
 namespace {
 
-constexpr double kChi2Gate3Dof = 14.16;
-constexpr double kMaxPredictGapS = 60.0;
-constexpr double kProcessNoiseAccel = 5.0;
-constexpr double kMeasurementNoiseM = 200.0;
-constexpr double kMaxTrackAgeS = 300.0;
-constexpr int kMinTrackUpdates = 2;
-constexpr int kMaxTrackHistory = 100;
-constexpr double kMpsToKts = 1.9438444924406;
-constexpr double kMpsToFpm = 196.85039370079;
-constexpr double kStatsInterval = 30.0;
-constexpr double kPruneInterval = 60.0;
-constexpr double kMax2SensorQualityResidualM = 50.0;
+// --- EKF and track management constants ---
+constexpr double kChi2Gate3Dof = 14.16;          // Chi-squared gate (3-DOF, 99.7% confidence)
+constexpr double kMaxPredictGapS = 60.0;          // max gap before inflating covariance
+constexpr double kProcessNoiseAccel = 5.0;         // process noise acceleration (m/s²)
+constexpr double kMeasurementNoiseM = 200.0;       // default measurement noise (m)
+constexpr double kMaxTrackAgeS = 300.0;            // prune tracks older than this (s)
+constexpr int kMinTrackUpdates = 2;                // min updates to mark track established
+constexpr int kMaxTrackHistory = 100;              // max stored position history per track
+constexpr double kMpsToKts = 1.9438444924406;      // m/s to knots conversion
+constexpr double kMpsToFpm = 196.85039370079;      // m/s to ft/min conversion
+constexpr double kStatsInterval = 30.0;            // stats logging interval (s)
+constexpr double kPruneInterval = 60.0;            // track pruning interval (s)
+constexpr double kMax2SensorQualityResidualM = 50.0; // quality gate for 2-sensor fixes
 
+// Monotonic wall clock for track age and pruning decisions.
 double monotonic_now() {
   using clock = std::chrono::steady_clock;
   return std::chrono::duration<double>(clock::now().time_since_epoch()).count();
 }
 
+// 3x3 matrix inversion with partial pivoting (for S^{-1} in EKF update).
 bool invert3(std::array<std::array<double, 3>, 3> a, std::array<std::array<double, 3>, 3>& inv) {
   for (int i = 0; i < 3; ++i) {
     for (int j = 0; j < 3; ++j) {
@@ -75,6 +83,7 @@ bool invert3(std::array<std::array<double, 3>, 3> a, std::array<std::array<doubl
   return true;
 }
 
+// 3x3 matrix-vector multiply.
 std::array<double, 3> mat3_vec(const std::array<std::array<double, 3>, 3>& m, const std::array<double, 3>& v) {
   std::array<double, 3> out{};
   for (int i = 0; i < 3; ++i) {
@@ -85,6 +94,7 @@ std::array<double, 3> mat3_vec(const std::array<std::array<double, 3>, 3>& m, co
   return out;
 }
 
+// Append parse_errors count to a JSON stats string.
 std::string stats_with_parse_errors(const std::string& base, int parse_errors) {
   std::string out = base;
   if (!out.empty() && out.back() == '}') {
@@ -96,6 +106,7 @@ std::string stats_with_parse_errors(const std::string& base, int parse_errors) {
 
 }  // namespace
 
+// Initialise EKF state: position from first fix, zero velocity, large velocity variance.
 AircraftEKF::AircraftEKF(const Vec3& position, double timestamp_s, double process_accel_, double meas_noise_) {
   x = {position.x, position.y, position.z, 0.0, 0.0, 0.0};
   for (int i = 0; i < 6; ++i) {
@@ -115,6 +126,7 @@ AircraftEKF::AircraftEKF(const Vec3& position, double timestamp_s, double proces
   meas_noise = meas_noise_;
 }
 
+// Predict step: propagate state with constant-velocity model, add process noise Q.
 Vec3 AircraftEKF::predict(double timestamp_s) {
   double dt = timestamp_s - last_timestamp_s;
   if (dt <= 0.0) {
@@ -174,6 +186,8 @@ Vec3 AircraftEKF::predict(double timestamp_s) {
   return position();
 }
 
+// Update step: compute innovation, Chi-squared gate, Kalman gain, Joseph-form covariance update.
+// Returns Mahalanobis distance on success, -1.0 if measurement is gated out.
 double AircraftEKF::update(const Vec3& measurement, double timestamp_s, std::optional<double> measurement_noise_m) {
   predict(timestamp_s);
   std::array<double, 3> y = {measurement.x - x[0], measurement.y - x[1], measurement.z - x[2]};
@@ -321,6 +335,7 @@ bool TrackState::is_established() const {
   return ekf.updates >= kMinTrackUpdates;
 }
 
+// Compute true heading from EKF velocity projected onto local East-North plane.
 double TrackState::heading_deg() const {
   Vec3 vel = ekf.velocity();
   if (norm(vel) < 1.0) {
@@ -340,6 +355,7 @@ double TrackState::heading_deg() const {
   return std::fmod(std::atan2(ve, vn) * 180.0 / M_PI + 360.0, 360.0);
 }
 
+// Compute ground speed from EKF velocity (ECEF -> local ENU -> horizontal magnitude).
 double TrackState::ground_speed_kts() const {
   Vec3 vel = ekf.velocity();
   Vec3 pos = ekf.position();
@@ -356,6 +372,7 @@ double TrackState::ground_speed_kts() const {
   return std::sqrt(ve * ve + vn * vn) * kMpsToKts;
 }
 
+// Compute vertical rate from EKF velocity (ECEF -> local Up component).
 double TrackState::vertical_rate_fpm() const {
   Vec3 vel = ekf.velocity();
   Vec3 pos = ekf.position();
@@ -371,6 +388,7 @@ double TrackState::vertical_rate_fpm() const {
   return vu * kMpsToFpm;
 }
 
+// Build output record: rotate ECEF covariance to ENU, extract kinematics.
 TrackOutput TrackState::to_output(const SolveFix& fix) const {
   Vec3 pos = ekf.position();
   auto [lat, lon, alt] = ecef_to_lla(pos.x, pos.y, pos.z);
@@ -433,6 +451,7 @@ TrackOutput TrackState::to_output(const SolveFix& fix) const {
   return out;
 }
 
+// Process a single L4 fix: apply 2-sensor quality gate, adaptive noise, create/update track.
 std::optional<TrackOutput> TrackManager::process_fix(const SolveFix& fix) {
   ++fixes_received;
   if (fix.icao.empty()) {
@@ -477,6 +496,7 @@ std::optional<TrackOutput> TrackManager::process_fix(const SolveFix& fix) {
   return it->second.to_output(fix);
 }
 
+// Attempt to solve an unsolved L4 group using existing track EKF prediction as prior.
 std::optional<TrackOutput> TrackManager::solve_prediction_aided(const Group& group) {
   if (group.icao.empty()) {
     return std::nullopt;
@@ -549,6 +569,7 @@ std::optional<TrackOutput> TrackManager::solve_prediction_aided(const Group& gro
   return process_fix(solved_fix);
 }
 
+// Route incoming L4 record: solved fixes go to process_fix, unsolved groups to prediction-aided solver.
 std::optional<TrackOutput> TrackManager::process_record(const Layer4Record& record) {
   if (record.is_unsolved_group) {
     ++fixes_received;
@@ -561,6 +582,7 @@ std::optional<TrackOutput> TrackManager::process_record(const Layer4Record& reco
   return process_fix(record.fix);
 }
 
+// Remove tracks that haven't been updated in kMaxTrackAgeS seconds.
 int TrackManager::prune_stale() {
   double now = monotonic_now();
   std::vector<std::string> stale;
@@ -600,6 +622,7 @@ std::string TrackManager::stats_json() const {
   return os.str();
 }
 
+// Layer 5 main loop: read JSONL L4 records, update tracks, write track outputs, periodic prune.
 int run_layer5(std::istream& in, std::ostream& out, std::ostream& log) {
   log << "=== MLAT Track Builder (Layer 5) — Native ===\n";
   log << "Reading JSONL position fixes from stdin\n";

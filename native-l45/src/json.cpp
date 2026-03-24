@@ -1,3 +1,7 @@
+// json.cpp — JSON parsing, serialisation, and JSONL record I/O.
+// Provides two parsing paths: a zero-copy fast parser for the hot path (JSONL groups)
+// and a full recursive-descent parser for general JSON (overrides, L4 records).
+// Also handles serialisation of SolveFix, TrackOutput, and Group to JSONL.
 #include "core.hpp"
 
 #include <charconv>
@@ -11,6 +15,8 @@
 namespace native_l45 {
 
 namespace {
+
+// --- Fast zero-copy JSON parser (for hot-path JSONL group parsing) ---
 
 struct FastCursor {
   const char* cur = nullptr;
@@ -205,6 +211,7 @@ bool fast_parse_receptions(FastCursor& cursor, std::vector<Reception>& out) {
   }
 }
 
+// Fast-path group parser: zero-copy, no allocations for keys, uses from_chars for numbers.
 bool parse_group_json_fast(std::string_view line, Group& out) {
   FastCursor cursor{line.data(), line.data() + line.size()};
   if (!fast_consume(cursor, '{')) {
@@ -268,6 +275,9 @@ bool parse_group_json_fast(std::string_view line, Group& out) {
   return true;
 }
 
+// --- Fallback parsers using full JsonParser ---
+
+// Parse a single reception from a JsonValue object.
 std::optional<Reception> parse_reception_object(const JsonValue::Object& object) {
   auto sensor_id = json_get_int_optional(object, "sensor_id");
   auto lat = json_get_number_optional(object, "lat");
@@ -289,6 +299,7 @@ std::optional<Reception> parse_reception_object(const JsonValue::Object& object)
   return reception;
 }
 
+// Parse a correlation group from a JsonValue object.
 bool parse_group_object(const JsonValue::Object& object, Group& out) {
   auto icao = json_get_string_optional(object, "icao");
   auto df_type = json_get_int_optional(object, "df_type");
@@ -324,6 +335,7 @@ bool parse_group_object(const JsonValue::Object& object, Group& out) {
   return true;
 }
 
+// Parse a SolveFix from a JsonValue object (L4 output).
 bool parse_fix_object(const JsonValue::Object& object, SolveFix& out) {
   auto icao = json_get_string_optional(object, "icao");
   auto lat = json_get_number_optional(object, "lat");
@@ -361,6 +373,8 @@ bool parse_fix_object(const JsonValue::Object& object, SolveFix& out) {
   return true;
 }
 
+// --- JSON serialisation helpers ---
+
 void append_json_string(std::ostringstream& os, std::string_view value) {
   os << '"' << json_escape(value) << '"';
 }
@@ -374,6 +388,7 @@ std::string format_double(double value) {
   return os.str();
 }
 
+// Serialise a Group to a JSON object string.
 std::string group_json_object(const Group& group) {
   std::ostringstream os;
   os << '{';
@@ -422,6 +437,8 @@ std::string squawk_json(const std::optional<std::string>& squawk) {
 }
 
 }  // namespace
+
+// --- JsonValue type accessors ---
 
 bool JsonValue::is_null() const { return std::holds_alternative<std::nullptr_t>(storage); }
 bool JsonValue::is_bool() const { return std::holds_alternative<bool>(storage); }
@@ -654,6 +671,8 @@ JsonValue JsonParser::parse_object() {
   return JsonValue{JsonValue::Storage{std::move(out)}};
 }
 
+// --- JSON object field accessors ---
+
 const JsonValue* json_find(const JsonValue::Object& object, std::string_view key) {
   for (const auto& [name, value] : object) {
     if (name == key) {
@@ -695,6 +714,7 @@ std::optional<bool> json_get_bool_optional(const JsonValue::Object& object, std:
   return value->as_bool();
 }
 
+// Parse a JSONL group line: tries fast parser first, falls back to full parser.
 bool parse_group_json(std::string_view line, Group& out) {
   if (parse_group_json_fast(line, out)) {
     return true;
@@ -711,6 +731,7 @@ bool parse_group_json(std::string_view line, Group& out) {
   }
 }
 
+// Parse a Layer 4 output record (either a solved fix or an unsolved group passthrough).
 bool parse_layer4_record_json(std::string_view line, Layer4Record& out) {
   try {
     JsonParser parser(line);
@@ -736,10 +757,14 @@ bool parse_layer4_record_json(std::string_view line, Layer4Record& out) {
   }
 }
 
+// --- JSONL serialisation ---
+
+// Wrap an unsolved group for passthrough to Layer 5.
 std::string to_json_unsolved_group(const Group& group) {
   return std::string{"{\"unsolved_group\":"} + group_json_object(group) + "}";
 }
 
+// Serialise a SolveFix to JSONL.
 std::string to_json_fix(const SolveFix& fix) {
   std::ostringstream os;
   os << '{';
@@ -765,6 +790,7 @@ std::string to_json_fix(const SolveFix& fix) {
   return os.str();
 }
 
+// Serialise a TrackOutput to JSONL.
 std::string to_json_track(const TrackOutput& track) {
   std::ostringstream os;
   os << '{';
@@ -796,6 +822,7 @@ std::string to_json_track(const TrackOutput& track) {
   return os.str();
 }
 
+// Escape a string for JSON output (handles control chars, quotes, backslashes).
 std::string json_escape(std::string_view value) {
   std::string out;
   out.reserve(value.size());

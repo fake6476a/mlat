@@ -17,36 +17,46 @@ All layers are connected via Unix pipes (stdin/stdout JSONL). Layers 4+5 run in 
 
 Run every command in this README from the repository root.
 
----
+## Pipeline Flow
 
-## Techniques & Algorithms
-
-### Layer 4 — MLAT Solver (`native-l45/src/solver.cpp`, `layer4.cpp`, `state.cpp`, `geo_adsb.cpp`)
-
-- **Coordinates:** WGS84 geodetic ↔ ECEF conversions with Bowring's iterative method
-- **Solver:** Levenberg-Marquardt optimizer with Soft-L1 robust loss (f_scale=500 m)
-- **Initialization:** Inamdar algebraic closed-form (≥5 sensors), Inamdar + altitude constraint (4 sensors), centroid fallback, prior-aided (2-3 sensors via position cache)
-- **TOA model:** Frisch-style TDOA→TOA with emission-time (t₀) elimination
-- **Altitude constraint:** Barometric altitude injected as weighted residual term
-- **Outlier rejection:** Iterative worst-sensor removal for ≥4 sensor groups (threshold 3 km)
-- **GDOP filtering:** 3D GDOP for ≥4 sensors (max 20), 2D GDOP for 2-3 sensors (max 10)
-- **Clock calibration:** Kalman filter per sensor pair tracking offset + drift, trained on ADS-B reference positions
-- **Position cache:** Per-ICAO position/velocity cache for prior-aided solving and physical consistency checks (max speed 1030 m/s)
-- **CPR decoding:** ADS-B Compact Position Reporting (global + local decode) for position seeding
-- **Atmospheric refraction:** Effective velocity via exponential atmosphere model (replaces vacuum c)
-- **Location overrides:** Known sensor positions from `data-pipe/location-overrides.txt` replace stream-reported GPS
-
-### Layer 5 — Track Builder (`native-l45/src/track.cpp`)
-
-- **EKF:** 6-state constant-velocity model `[x, y, z, vx, vy, vz]` in ECEF
-- **Process noise:** Constant-acceleration model (default 5 m/s²)
-- **Measurement noise:** Adaptive — scales with sensor count, GDOP, and quality residual
-- **Innovation gate:** Chi-squared 3-DOF at 99.7% confidence (Mahalanobis threshold 14.16)
-- **2-sensor quality filter:** Rejects fixes with quality_residual > 50 m
-- **Covariance update:** Joseph-form for numerical stability
-- **Prediction-aided solving:** Re-solves unsolved L4 groups using established track EKF predictions
-- **Output:** ENU covariance matrix, heading, ground speed, vertical rate per track update
-- **Track pruning:** Removes tracks with no updates for >300 s
+```
+                          ┌─────────────────────────────────────┐
+                          │        Raw ADS-B Sensor Feed        │
+                          └──────────────┬──────────────────────┘
+                                         │
+                          ┌──────────────▼──────────────────────┐
+                          │  Layer 1 — Go data-pipe             │
+                          │  Ingest raw sensor data via Neuron  │
+                          └──────────────┬──────────────────────┘
+                                         │  stdout JSONL
+                          ┌──────────────▼──────────────────────┐
+                          │  Layer 2 — Python modes-decoder     │
+                          │  Decode ADS-B frames (DF17, etc.)   │
+                          └──────────────┬──────────────────────┘
+                                         │  stdout JSONL
+                          ┌──────────────▼──────────────────────┐
+                          │  Layer 3 — Python correlation       │
+                          │  Group receptions by TOA into       │
+                          │  correlation groups                 │
+                          └──────────────┬──────────────────────┘
+                                         │  stdout JSONL (groups)
+                          ┌──────────────▼──────────────────────┐
+                          │  Layer 4 — C++ mlat-solver          │
+                          │  TOA multilateration solving        │
+                          │  (LM optimizer, clock cal, GDOP)    │
+                          └──────────────┬──────────────────────┘
+                                         │  stdout JSONL (fixes + unsolved)
+                          ┌──────────────▼──────────────────────┐
+                          │  Layer 5 — C++ track-builder        │
+                          │  EKF track filtering & prediction   │
+                          │  (Chi² gating, adaptive noise)      │
+                          └──────────────┬──────────────────────┘
+                                         │  stdout JSONL (tracks)
+                          ┌──────────────▼──────────────────────┐
+                          │  Layer 6 — Python live-map          │
+                          │  Browser-based live aircraft map    │
+                          └─────────────────────────────────────┘
+```
 
 ---
 

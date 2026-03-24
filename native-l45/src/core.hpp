@@ -1,3 +1,6 @@
+// core.hpp — Shared declarations for the native MLAT pipeline (Layers 4 & 5).
+// Defines data structures, coordinate transforms, solver interfaces, EKF,
+// clock calibration, position caching, CPR decoding, and JSON utilities.
 #pragma once
 
 #include <array>
@@ -14,6 +17,7 @@
 
 namespace native_l45 {
 
+// 3D vector used for ECEF positions and velocities (metres).
 struct Vec3 {
   double x = 0.0;
   double y = 0.0;
@@ -80,67 +84,75 @@ inline double norm(const Vec3& v) {
   return std::sqrt(norm_sq(v));
 }
 
+// 3x3 matrix (used for covariance rotations).
 struct Mat3 {
   std::array<std::array<double, 3>, 3> m{};
 };
 
+// 6x6 matrix (EKF state covariance: position + velocity).
 struct Mat6 {
   std::array<std::array<double, 6>, 6> m{};
 };
 
+// A single sensor reception: sensor position + nanosecond-precision TOA.
 struct Reception {
   std::int64_t sensor_id = 0;
-  double lat = 0.0;
-  double lon = 0.0;
-  double alt = 0.0;
-  Vec3 sensor_ecef{};
+  double lat = 0.0;          // sensor latitude (deg)
+  double lon = 0.0;          // sensor longitude (deg)
+  double alt = 0.0;          // sensor altitude (m)
+  Vec3 sensor_ecef{};        // precomputed ECEF position
   std::int64_t timestamp_s = 0;
   std::int64_t timestamp_ns = 0;
 };
 
+// A correlation group: one ADS-B message received by multiple sensors.
 struct Group {
-  std::string icao;
-  int df_type = 0;
-  std::optional<double> altitude_ft;
+  std::string icao;                       // aircraft ICAO hex address
+  int df_type = 0;                        // downlink format type
+  std::optional<double> altitude_ft;      // barometric altitude if available
   std::optional<std::string> squawk;
-  std::string raw_msg;
+  std::string raw_msg;                    // raw hex ADS-B message
   int num_sensors = 0;
-  std::vector<Reception> receptions;
+  std::vector<Reception> receptions;      // one per sensor that received this message
 };
 
+// A solved multilateration position fix produced by Layer 4.
 struct SolveFix {
   std::string icao;
-  double lat = 0.0;
-  double lon = 0.0;
-  double alt_ft = 0.0;
-  double residual_m = 0.0;
-  double quality_residual_m = 0.0;
-  double gdop = 0.0;
-  int num_sensors = 0;
-  std::string solve_method;
+  double lat = 0.0;                  // solved latitude (deg)
+  double lon = 0.0;                  // solved longitude (deg)
+  double alt_ft = 0.0;               // altitude (ft) — baro or solved
+  double residual_m = 0.0;           // RMS timing residual (m)
+  double quality_residual_m = 0.0;   // max(residual, prior_offset) for 2-sensor
+  double gdop = 0.0;                 // geometric dilution of precision
+  int num_sensors = 0;               // sensors used in final solve
+  std::string solve_method;          // e.g. prior_2sensor, constrained_3sensor
   std::int64_t timestamp_s = 0;
   std::int64_t timestamp_ns = 0;
   int df_type = 0;
   std::optional<std::string> squawk;
   std::string raw_msg;
-  double t0_s = 0.0;
+  double t0_s = 0.0;                 // estimated emission time
 };
 
+// Layer 4 output record: either a solved fix or an unsolved group passed through
+// for Layer 5 prediction-aided solving.
 struct Layer4Record {
   bool is_unsolved_group = false;
   Group unsolved_group;
   SolveFix fix;
 };
 
+// Layer 5 output: EKF-filtered track update with kinematics and covariance.
 struct TrackOutput {
   std::string icao;
   double lat = 0.0;
   double lon = 0.0;
   double alt_ft = 0.0;
-  double heading_deg = 0.0;
-  double speed_kts = 0.0;
-  double vrate_fpm = 0.0;
-  int track_quality = 0;
+  double heading_deg = 0.0;       // true heading from EKF velocity
+  double speed_kts = 0.0;         // ground speed
+  double vrate_fpm = 0.0;         // vertical rate (ft/min)
+  int track_quality = 0;          // number of EKF updates
   int positions_count = 0;
   double residual_m = 0.0;
   double quality_residual_m = 0.0;
@@ -153,9 +165,10 @@ struct TrackOutput {
   std::optional<std::string> squawk;
   std::string raw_msg;
   double t0_s = 0.0;
-  std::array<std::array<double, 2>, 2> cov_matrix{};
+  std::array<std::array<double, 2>, 2> cov_matrix{};  // 2x2 ENU position covariance
 };
 
+// Lightweight JSON value (variant-based) for parsing JSONL input/output.
 struct JsonValue {
   using Array = std::vector<JsonValue>;
   using Object = std::vector<std::pair<std::string, JsonValue>>;
@@ -217,24 +230,27 @@ std::string json_escape(std::string_view value);
 double round_to(double value, int digits);
 double clamp(double value, double lo, double hi);
 
-constexpr double kVacuumC = 299792458.0;
-constexpr double kAirC = 299702547.0;
+constexpr double kVacuumC = 299792458.0;   // speed of light in vacuum (m/s)
+constexpr double kAirC = 299702547.0;      // effective speed at sea level (m/s)
 
+// --- Coordinate conversions (WGS84 geodetic <-> ECEF) ---
 Vec3 lla_to_ecef(double lat_deg, double lon_deg, double alt_m);
-Vec3 sensor_lla_to_ecef(double lat_deg, double lon_deg, double alt_m);
-std::tuple<double, double, double> ecef_to_lla(double x, double y, double z);
+Vec3 sensor_lla_to_ecef(double lat_deg, double lon_deg, double alt_m);  // cached version
+std::tuple<double, double, double> ecef_to_lla(double x, double y, double z);  // Bowring iterative
 double ft_to_m(double feet);
 double m_to_ft(double meters);
-double effective_velocity(double h_sensor, double h_aircraft);
+double effective_velocity(double h_sensor, double h_aircraft);  // atmospheric refraction model
 
+// ADS-B Compact Position Reporting frame (even/odd).
 struct CPRFrame {
-  int f_bit = 0;
-  int lat_cpr = 0;
-  int lon_cpr = 0;
+  int f_bit = 0;          // 0 = even, 1 = odd
+  int lat_cpr = 0;        // 17-bit encoded latitude
+  int lon_cpr = 0;        // 17-bit encoded longitude
   std::optional<int> alt_ft;
   double timestamp = 0.0;
 };
 
+// Decoded DF17 airborne velocity message.
 struct DecodedVelocity {
   double ew_knots = 0.0;
   double ns_knots = 0.0;
@@ -243,6 +259,7 @@ struct DecodedVelocity {
   int vrate_fpm = 0;
 };
 
+// Decoded ADS-B position from CPR global/local decode.
 struct ADSBPosition {
   double lat = 0.0;
   double lon = 0.0;
@@ -251,6 +268,7 @@ struct ADSBPosition {
   std::string icao;
 };
 
+// Buffers even/odd CPR frames per ICAO and performs global + local position decode.
 class CPRBuffer {
  public:
   std::optional<ADSBPosition> add_frame(const std::string& icao, const CPRFrame& frame);
@@ -274,6 +292,7 @@ std::optional<CPRFrame> extract_df17_position_fields(const std::string& raw_msg)
 std::optional<DecodedVelocity> extract_df17_velocity(const std::string& raw_msg);
 Vec3 position_to_ecef(double lat, double lon, const std::optional<int>& alt_ft);
 
+// A known sensor position loaded from location-overrides.txt.
 struct OverrideEntry {
   std::string public_key;
   double lat = 0.0;
@@ -282,6 +301,7 @@ struct OverrideEntry {
   std::string name;
 };
 
+// Maps sensor IDs to known positions; replaces stream-reported GPS with surveyed coords.
 class SensorOverrideMap {
  public:
   explicit SensorOverrideMap(std::vector<OverrideEntry> overrides = {});
@@ -299,21 +319,23 @@ class SensorOverrideMap {
 std::optional<SensorOverrideMap> load_location_overrides();
 std::vector<Reception> apply_overrides(const std::vector<Reception>& receptions, SensorOverrideMap& override_map);
 
+// Per-ICAO cached position + velocity for prior-aided solving.
 struct CachedPosition {
   Vec3 ecef;
   double lat = 0.0;
   double lon = 0.0;
   double alt_m = 0.0;
   double timestamp = 0.0;
-  std::optional<Vec3> velocity_ecef;
+  std::optional<Vec3> velocity_ecef;  // derived from consecutive solves or ADS-B
   double residual_m = 0.0;
   int solve_count = 1;
   double last_order = 0.0;
 
-  Vec3 predict(double target_timestamp) const;
+  Vec3 predict(double target_timestamp) const;  // linear extrapolation
   bool is_physically_consistent(const Vec3& new_ecef, double new_timestamp, double new_residual_m = 0.0) const;
 };
 
+// LRU position cache keyed by ICAO. Provides prior positions for 2-sensor solving.
 class PositionCache {
  public:
   std::optional<CachedPosition> get(const std::string& icao, std::optional<double> target_timestamp = std::nullopt);
@@ -330,28 +352,31 @@ class PositionCache {
   std::uint64_t misses_ = 0;
 };
 
+// Kalman filter tracking clock offset + drift between a pair of sensors.
 class ClockPairing {
  public:
   ClockPairing() = default;
   ClockPairing(std::int64_t sensor_a, std::int64_t sensor_b);
 
-  bool update(double measured_offset, double now);
-  double predict(double now) const;
+  bool update(double measured_offset, double now);   // Kalman update step
+  double predict(double now) const;                   // predict current offset
 
   std::int64_t sensor_a = 0;
   std::int64_t sensor_b = 0;
-  int n = 0;
-  double offset = 0.0;
-  double drift = 0.0;
-  double variance = 2.5e-9;
-  double p00 = 2.5e-9;
+  int n = 0;                       // number of observations
+  double offset = 0.0;            // estimated clock offset (s)
+  double drift = 0.0;             // estimated clock drift (s/s)
+  double variance = 2.5e-9;       // offset estimate variance
+  double p00 = 2.5e-9;            // Kalman P[0][0]
   double p01 = 0.0;
   double p11 = 1e-12;
-  bool valid = false;
+  bool valid = false;              // true after kMinSyncPoints observations
   double last_update = 0.0;
   int consecutive_outliers = 0;
 };
 
+// Network clock calibrator: learns per-pair offsets from ADS-B reference positions,
+// then corrects TOA timestamps using minimum-variance spanning tree.
 class ClockCalibrator {
  public:
   void process_adsb_reference(const Vec3& aircraft_ecef, const std::vector<Reception>& receptions, double now);
@@ -369,19 +394,22 @@ class ClockCalibrator {
   ClockPairing& get_pairing(std::int64_t a, std::int64_t b);
 };
 
-double compute_gdop(const Vec3& aircraft_pos, const std::vector<Vec3>& sensor_positions);
-double compute_gdop_2d(const Vec3& aircraft_pos, const std::vector<Vec3>& sensor_positions);
+// Geometric Dilution of Precision — measures sensor geometry quality.
+double compute_gdop(const Vec3& aircraft_pos, const std::vector<Vec3>& sensor_positions);     // 3D (>=4 sensors)
+double compute_gdop_2d(const Vec3& aircraft_pos, const std::vector<Vec3>& sensor_positions);  // 2D (2-3 sensors)
 
+// Result from the Levenberg-Marquardt TOA solver.
 struct ToaResult {
-  Vec3 position;
-  double residual_m = 0.0;
-  double objective_residual_m = 0.0;
-  double t0_s = 0.0;
-  double cost = 0.0;
-  int nfev = 0;
+  Vec3 position;                   // solved ECEF position
+  double residual_m = 0.0;        // RMS timing residual (m)
+  double objective_residual_m = 0.0; // includes altitude + prediction terms
+  double t0_s = 0.0;              // estimated emission time
+  double cost = 0.0;              // final Soft-L1 cost
+  int nfev = 0;                   // number of function evaluations
   bool success = false;
 };
 
+// Algebraic closed-form initializers (Inamdar method) for the LM solver.
 std::optional<Vec3> inamdar_5sensor(const std::vector<Vec3>& sensors, const std::vector<double>& arrival_times);
 std::optional<Vec3> inamdar_4sensor_altitude(const std::vector<Vec3>& sensors, const std::vector<double>& arrival_times, double altitude_m);
 Vec3 centroid_init(const std::vector<Vec3>& sensors, std::optional<double> altitude_m);
@@ -401,13 +429,16 @@ std::optional<ToaResult> solve_constrained_3sensor(
     double altitude_m,
     const Vec3& x0);
 
+// Outcome of solve_group(): either a SolveFix or a failure reason string.
 struct SolveOutcome {
   std::optional<SolveFix> result;
   std::string fail_reason;
 };
 
+// Top-level solver: picks method based on sensor count, runs LM, validates result.
 SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position_prior_ecef, double prior_uncertainty_m = 500.0);
 
+// Aggregated statistics for Layer 4 solver performance.
 class Layer4Stats {
  public:
   void record_solve(const std::string& method, double residual_m);
@@ -425,6 +456,7 @@ class Layer4Stats {
   std::unordered_map<std::int64_t, std::vector<double>> sensor_residuals_m;
 };
 
+// Main Layer 4 processing loop: reads JSONL groups, solves, writes fixes.
 class Layer4Processor {
  public:
   Layer4Processor();
@@ -446,11 +478,14 @@ class Layer4Processor {
 
 int run_layer4(std::istream& in, std::ostream& out, std::ostream& log);
 
+// 6-state Extended Kalman Filter: constant-velocity model [x,y,z,vx,vy,vz] in ECEF.
+// Process noise: constant-acceleration (default 5 m/s²).
+// Measurement gate: Chi-squared 3-DOF at 99.7% confidence.
 class AircraftEKF {
  public:
   AircraftEKF(const Vec3& position, double timestamp_s, double process_accel = 5.0, double meas_noise = 200.0);
-  Vec3 predict(double timestamp_s);
-  double update(const Vec3& measurement, double timestamp_s, std::optional<double> measurement_noise_m = std::nullopt);
+  Vec3 predict(double timestamp_s);       // propagate state + covariance
+  double update(const Vec3& measurement, double timestamp_s, std::optional<double> measurement_noise_m = std::nullopt);  // returns Mahalanobis distance, -1 if gated
   Vec3 position() const;
   Vec3 velocity() const;
   double median_innovation() const;
@@ -464,10 +499,11 @@ class AircraftEKF {
   double meas_noise = 200.0;
 };
 
+// Per-aircraft track state: wraps an EKF and stores position history.
 struct TrackState {
   std::string icao;
   AircraftEKF ekf;
-  std::vector<std::array<double, 4>> positions;
+  std::vector<std::array<double, 4>> positions;  // [lat, lon, alt_ft, timestamp]
   std::vector<double> timestamps;
   double last_update_order = 0.0;
   double creation_order = 0.0;
@@ -485,10 +521,12 @@ struct TrackState {
   TrackOutput to_output(const SolveFix& fix) const;
 };
 
+// Manages all active aircraft tracks. Processes L4 fixes, creates/updates EKFs,
+// prunes stale tracks, and attempts prediction-aided solving for unsolved groups.
 class TrackManager {
  public:
   std::optional<TrackOutput> process_record(const Layer4Record& record);
-  int prune_stale();
+  int prune_stale();             // remove tracks older than 300 s
   std::string stats_json() const;
 
  private:
