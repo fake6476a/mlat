@@ -248,8 +248,6 @@ Location overrides provide meaningful quality improvement with no measurable per
 | Native C++ L4 | 30-min (77k groups) | 47.2% | 16.5 m | 129-130 m | 1m08s |
 | Native C++ L4+L5 | 1-hour (166k groups) | 51.0% | 18.91 m | 140.80 m | 3.8s |
 
-The full benchmark breakdown (per-run timing, residual distributions, failure reasons, clock calibration, position cache, CPR buffer, per-sensor bias) is in [`benchmarks/BENCHMARK_1H_RESULTS.md`](benchmarks/BENCHMARK_1H_RESULTS.md).
-
 ---
 
 ## 6. Private Local Files
