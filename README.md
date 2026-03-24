@@ -19,6 +19,37 @@ Run every command in this README from the repository root.
 
 ---
 
+## Techniques & Algorithms
+
+### Layer 4 — MLAT Solver (`native-l45/src/solver.cpp`, `layer4.cpp`, `state.cpp`, `geo_adsb.cpp`)
+
+- **Coordinates:** WGS84 geodetic ↔ ECEF conversions with Bowring's iterative method
+- **Solver:** Levenberg-Marquardt optimizer with Soft-L1 robust loss (f_scale=500 m)
+- **Initialization:** Inamdar algebraic closed-form (≥5 sensors), Inamdar + altitude constraint (4 sensors), centroid fallback, prior-aided (2-3 sensors via position cache)
+- **TOA model:** Frisch-style TDOA→TOA with emission-time (t₀) elimination
+- **Altitude constraint:** Barometric altitude injected as weighted residual term
+- **Outlier rejection:** Iterative worst-sensor removal for ≥4 sensor groups (threshold 3 km)
+- **GDOP filtering:** 3D GDOP for ≥4 sensors (max 20), 2D GDOP for 2-3 sensors (max 10)
+- **Clock calibration:** Kalman filter per sensor pair tracking offset + drift, trained on ADS-B reference positions
+- **Position cache:** Per-ICAO position/velocity cache for prior-aided solving and physical consistency checks (max speed 1030 m/s)
+- **CPR decoding:** ADS-B Compact Position Reporting (global + local decode) for position seeding
+- **Atmospheric refraction:** Effective velocity via exponential atmosphere model (replaces vacuum c)
+- **Location overrides:** Known sensor positions from `data-pipe/location-overrides.txt` replace stream-reported GPS
+
+### Layer 5 — Track Builder (`native-l45/src/track.cpp`)
+
+- **EKF:** 6-state constant-velocity model `[x, y, z, vx, vy, vz]` in ECEF
+- **Process noise:** Constant-acceleration model (default 5 m/s²)
+- **Measurement noise:** Adaptive — scales with sensor count, GDOP, and quality residual
+- **Innovation gate:** Chi-squared 3-DOF at 99.7% confidence (Mahalanobis threshold 14.16)
+- **2-sensor quality filter:** Rejects fixes with quality_residual > 50 m
+- **Covariance update:** Joseph-form for numerical stability
+- **Prediction-aided solving:** Re-solves unsolved L4 groups using established track EKF predictions
+- **Output:** ENU covariance matrix, heading, ground speed, vertical rate per track update
+- **Track pruning:** Removes tracks with no updates for >300 s
+
+---
+
 ## 1. Build
 
 ### 1.1 Python environment
@@ -191,10 +222,8 @@ Both the solver and tracker write a JSON summary to stderr at the end of each ru
 
 | Component | Wall Time (avg of 5 runs) | Throughput |
 |---|---:|---:|
-| Layer 4 solver | 3.635 s | 45,634 groups/s |
-| Layer 5 tracker | 2.371 s | 65,331 records/s |
-| Full pipeline (piped) | 3.813 s | 43,510 groups/s |
-| **Realtime factor** | | **944x** |
+| Full pipeline (L4+L5 piped) | 3.77 s | ~44,000 groups/s |
+| **Realtime factor** | | **~955x** |
 
 1 hour of captured data processes in under 4 seconds.
 
@@ -203,11 +232,10 @@ Both the solver and tracker write a JSON summary to stderr at the end of each ru
 | Metric | Value |
 |---|---:|
 | Groups received | 165,917 |
-| Groups solved | 84,561 |
-| Solve rate | 51.0% |
-| Median residual | 18.91 m |
-| p95 residual | 140.80 m |
-| Mean residual | 37.05 m |
+| Groups solved | 84,558 |
+| Solve rate | 51% |
+| Median residual | 18.95 m |
+| p95 residual | 140.9 m |
 
 Solve method breakdown: 98.9% prior_2sensor, 1.0% constrained_3sensor, 0.1% other.
 
@@ -216,37 +244,20 @@ Solve method breakdown: 98.9% prior_2sensor, 1.0% constrained_3sensor, 0.1% othe
 | Metric | Value |
 |---|---:|
 | Fixes received | 154,301 |
-| Fixes accepted (EKF gate) | 67,084 |
-| Accept rate | 43.5% |
+| Fixes accepted | 43,246 |
+| Fixes rejected (EKF gate) | 49,656 |
+| Rejected (2-sensor quality) | 34,858 |
+| Accept rate | 28% |
 | Unique aircraft tracked | 120 |
-| Median residual | 23.23 m |
-| p95 residual | 161.75 m |
-| Median track quality | 563 |
+| Established tracks | 120 |
 
-### 5.4 Impact of Location Overrides
-
-| Metric | Without Overrides | With Overrides | Change |
-|---|---:|---:|---|
-| Solve rate | 50.8% | 51.0% | +0.2pp |
-| Median residual (L4) | 22.47 m | 18.91 m | **-15.8%** |
-| Mean residual (L4) | 39.36 m | 37.05 m | -5.9% |
-| p95 residual (L4) | 141.01 m | 140.80 m | -0.1% |
-| L5 EKF accept rate | 40.6% | 43.5% | +2.9pp |
-| L5 track updates | 62,929 | 67,084 | **+6.6%** |
-| L5 median residual | 26.99 m | 23.23 m | **-13.9%** |
-| L5 median quality | 508 | 563 | +10.8% |
-| GDOP mean | 981.57 | 148.72 | **-84.8%** |
-| Pipeline wall time | 3.782 s | 3.813 s | +0.8% |
-
-Location overrides provide meaningful quality improvement with no measurable performance cost.
-
-### 5.5 Optimization History
+### 5.4 Optimization History
 
 | Stage | Dataset | Solve Rate | Median Residual | p95 Residual | Runtime |
 |---|---|---:|---:|---:|---:|
 | Python L4 baseline | 30-min (77k groups) | 46.7% | 18.19 m | 133.04 m | 3m38s |
 | Native C++ L4 | 30-min (77k groups) | 47.2% | 16.5 m | 129-130 m | 1m08s |
-| Native C++ L4+L5 | 1-hour (166k groups) | 51.0% | 18.91 m | 140.80 m | 3.8s |
+| Native C++ L4+L5 | 1-hour (166k groups) | 51% | 18.95 m | 140.9 m | 3.77s |
 
 ---
 
