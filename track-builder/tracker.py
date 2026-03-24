@@ -1,16 +1,4 @@
-"""Track manager for associating MLAT fixes to continuous flight tracks.
-
-Maintains a dictionary of per-ICAO aircraft tracks, each backed by an
-EKF instance. Handles track creation, update, and pruning of stale tracks.
-
-Computes derived quantities (heading, ground speed, vertical rate) from
-the EKF velocity state for downstream consumers (Layer 6 Live Map).
-
-References:
-  - MLAT_Verified_Combined_Reference.md Part 3.3 (Layer 5 spec)
-  - MLAT_Verified_Combined_Reference.md Part 22 (EKF formulas)
-  - MLAT_Verified_Combined_Reference.md Part 21 (Innovation gating)
-"""
+"""Manage MLAT fixes and fold them into continuous EKF-backed aircraft tracks."""
 
 from __future__ import annotations
 
@@ -21,23 +9,23 @@ import numpy as np
 
 from ekf import AircraftEKF
 
-# Add parent directory for geo module access
+# Add the solver directory to the import path for shared geo helpers.
 import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "mlat-solver"))
 
 from geo import ecef_to_lla, lla_to_ecef
 
-# Maximum track age (seconds) before pruning
+# Limit the time a stale track can survive without updates.
 MAX_TRACK_AGE_S = 300.0
 
-# Minimum updates for a track to be considered established
+# Require at least two updates before treating a track as established.
 MIN_TRACK_UPDATES = 2
 
-# Maximum number of track positions to retain in history
+# Keep at most this many historical positions per track.
 MAX_TRACK_HISTORY = 100
 
-# Conversion factors
+# Define velocity conversion factors.
 MPS_TO_KTS = 1.9438444924406  # meters/second to knots
 MPS_TO_FPM = 196.85039370079  # meters/second to feet/minute
 
@@ -86,24 +74,11 @@ class TrackState:
         squawk: str | None,
         measurement_noise_m: float | None = None,
     ) -> float:
-        """Update track with a new position fix.
-
-        Args:
-            position_ecef: Position [x, y, z] in ECEF meters.
-            timestamp_s: Measurement timestamp in seconds.
-            alt_ft: Altitude in feet.
-            df_type: Downlink format type.
-            squawk: Squawk code.
-            measurement_noise_m: Per-axis measurement noise (meters),
-                derived from solver residual and GDOP.
-
-        Returns:
-            Mahalanobis distance (-1.0 if rejected by gate).
-        """
+        """Update the track with a new position fix and return its gate distance."""
         mahal = self.ekf.update(position_ecef, timestamp_s, measurement_noise_m)
 
         if mahal >= 0:
-            # Measurement accepted
+            # Persist the accepted measurement and derived metadata.
             self.last_update_time = time.monotonic()
             self.last_alt_ft = alt_ft
             self.last_df_type = df_type
@@ -116,7 +91,7 @@ class TrackState:
             self.positions.append((lat, lon, alt_ft, timestamp_s))
             self.timestamps.append(timestamp_s)
 
-            # Trim history to MAX_TRACK_HISTORY
+            # Trim the stored track history to the configured limit.
             if len(self.positions) > MAX_TRACK_HISTORY:
                 self.positions = self.positions[-MAX_TRACK_HISTORY:]
                 self.timestamps = self.timestamps[-MAX_TRACK_HISTORY:]
@@ -135,23 +110,19 @@ class TrackState:
 
     @property
     def heading_deg(self) -> float:
-        """Estimated heading in degrees (0=N, 90=E, 180=S, 270=W).
-
-        Computed from the EKF velocity vector projected onto the
-        local ENU (East-North-Up) frame at the current position.
-        """
+        """Return the estimated heading in degrees from the local ENU velocity."""
         vel = self.ekf.velocity
         speed = np.linalg.norm(vel)
         if speed < 1.0:
             return 0.0
 
-        # Get current position in geodetic coordinates
+        # Convert the current ECEF position to geodetic coordinates.
         pos = self.ekf.position
         lat, lon, _ = ecef_to_lla(pos[0], pos[1], pos[2])
         lat_r = math.radians(lat)
         lon_r = math.radians(lon)
 
-        # ECEF to ENU rotation
+        # Build the local ENU basis vectors.
         sin_lat = math.sin(lat_r)
         cos_lat = math.cos(lat_r)
         sin_lon = math.sin(lon_r)
@@ -167,11 +138,7 @@ class TrackState:
 
     @property
     def ground_speed_kts(self) -> float:
-        """Estimated ground speed in knots.
-
-        Computed from horizontal components of the EKF velocity
-        projected to the local ENU frame.
-        """
+        """Return the estimated ground speed in knots from the ENU velocity."""
         vel = self.ekf.velocity
         pos = self.ekf.position
         lat, lon, _ = ecef_to_lla(pos[0], pos[1], pos[2])
@@ -191,11 +158,7 @@ class TrackState:
 
     @property
     def vertical_rate_fpm(self) -> float:
-        """Estimated vertical rate in feet per minute.
-
-        Computed from the vertical (Up) component of the EKF velocity
-        projected to the local ENU frame.
-        """
+        """Return the estimated vertical rate in feet per minute."""
         vel = self.ekf.velocity
         pos = self.ekf.position
         lat, lon, _ = ecef_to_lla(pos[0], pos[1], pos[2])
@@ -207,23 +170,16 @@ class TrackState:
         sin_lon = math.sin(lon_r)
         cos_lon = math.cos(lon_r)
 
-        # Up component
+        # Use the local Up component of the ENU velocity.
         vu = cos_lat * cos_lon * vel[0] + cos_lat * sin_lon * vel[1] + sin_lat * vel[2]
         return vu * MPS_TO_FPM
 
     def to_output_dict(self, fix: dict) -> dict:
-        """Build output dict combining EKF state with original fix data.
-
-        Args:
-            fix: Original position fix dict from Layer 4.
-
-        Returns:
-            Enriched output dict with track state.
-        """
+        """Build the Layer 5 output dict from EKF state and the input fix."""
         pos = self.ekf.position
         lat, lon, _ = ecef_to_lla(pos[0], pos[1], pos[2])
 
-        # Convert ECEF covariance to local ENU for 2D ellipse visualization
+        # Convert ECEF covariance into local ENU coordinates for 2D visualization.
         lat_r = math.radians(lat)
         lon_r = math.radians(lon)
         sin_lat = math.sin(lat_r)
@@ -266,18 +222,13 @@ class TrackState:
 
 
 class TrackManager:
-    """Manages all active aircraft tracks.
-
-    Associates incoming MLAT position fixes with existing tracks
-    by ICAO address, creates new tracks for unknown aircraft, and
-    prunes stale tracks that have not received updates.
-    """
+    """Manage active aircraft tracks and associate incoming MLAT fixes by ICAO."""
 
     def __init__(self) -> None:
-        # Active tracks keyed by ICAO hex address
+        # Store active tracks keyed by ICAO hex address.
         self._tracks: dict[str, TrackState] = {}
 
-        # Stats counters
+        # Track basic Layer 5 statistics.
         self.fixes_received = 0
         self.fixes_accepted = 0
         self.fixes_rejected = 0
@@ -285,17 +236,7 @@ class TrackManager:
         self.tracks_pruned = 0
 
     def process_fix(self, fix: dict) -> dict | None:
-        """Process a single position fix from Layer 4.
-
-        Args:
-            fix: Position fix dict from Layer 4 with fields:
-                icao, lat, lon, alt_ft, residual_m, gdop,
-                num_sensors, solve_method, timestamp_s, timestamp_ns,
-                df_type, squawk, raw_msg, t0_s
-
-        Returns:
-            Enriched track output dict, or None if rejected.
-        """
+        """Process one Layer 4 fix and return an enriched track update if accepted."""
         self.fixes_received += 1
 
         if "unsolved_group" in fix:
@@ -316,18 +257,18 @@ class TrackManager:
         if lat is None or lon is None:
             return None
 
-        # Convert altitude for ECEF computation
+        # Convert the reported altitude for ECEF computation.
         alt_m = alt_ft * 0.3048 if alt_ft is not None else 0.0
         if alt_ft is None:
             alt_ft = 0.0
 
-        # Convert to ECEF for EKF processing
+        # Convert the measurement into ECEF for EKF processing.
         position_ecef = lla_to_ecef(lat, lon, alt_m)
 
-        # Compute timestamp as float seconds
+        # Combine the timestamp fields into floating-point seconds.
         ts = float(timestamp_s) + float(timestamp_ns) * 1e-9
 
-        # R5+R8: Derive measurement noise from solver residual and GDOP
+        # Derive measurement noise from solver quality and geometry.
         residual_m = fix.get("quality_residual_m", fix.get("residual_m", 0.0))
         gdop = fix.get("gdop", 0.0)
         if residual_m > 0 and gdop > 0:
@@ -335,12 +276,12 @@ class TrackManager:
         elif residual_m > 0:
             meas_noise = min(2000.0, max(50.0, residual_m * 2.0))
         else:
-            meas_noise = None  # fall back to EKF default
+            meas_noise = None  # fall back to the EKF default
 
         track = self._tracks.get(icao)
 
         if track is None:
-            # Create new track
+            # Create a new track when this ICAO is first seen.
             track = TrackState(
                 icao=icao,
                 position_ecef=position_ecef,
@@ -354,7 +295,7 @@ class TrackManager:
             self.fixes_accepted += 1
             return track.to_output_dict(fix)
 
-        # Update existing track
+        # Update an existing track with the new measurement.
         mahal = track.update(
             position_ecef=position_ecef,
             timestamp_s=ts,
@@ -365,7 +306,7 @@ class TrackManager:
         )
 
         if mahal < 0:
-            # Rejected by innovation gate
+            # Drop fixes rejected by the innovation gate.
             self.fixes_rejected += 1
             return None
 
@@ -391,7 +332,7 @@ class TrackManager:
             return None
         altitude_m = float(altitude_ft) * 0.3048
 
-        # Extract sensor positions and arrival times
+        # Build the 2-sensor geometry and relative arrival times.
         sensor_positions = np.zeros((2, 3))
         sensor_alts_m = np.zeros(2)
         arrival_times = np.zeros(2)
@@ -407,13 +348,11 @@ class TrackManager:
             dt_ns = rec["timestamp_ns"] - ref_timestamp_ns
             arrival_times[i] = dt_s + dt_ns * 1e-9
 
-        # Predict track position for the new timestamp
+        # Predict the track position at the target timestamp.
         target_ts = float(ref_timestamp_s) + float(ref_timestamp_ns) * 1e-9
         predicted_ecef = track.ekf.predict(target_ts)
 
-        # R7: Scale prediction weight by EKF covariance quality.
-        # Tight prediction (low position uncertainty) → strong anchor.
-        # Uncertain prediction → let geometry dominate.
+        # Scale the prediction anchor from EKF covariance quality.
         pred_uncertainty = float(np.sqrt(np.trace(track.ekf.P[:3, :3])))
         pw = max(1.0, min(12.0, 500.0 / max(pred_uncertainty, 1.0)))
 
@@ -431,7 +370,7 @@ class TrackManager:
         if result is None:
             return None
 
-        # Format the result like a normal solved fix from Layer 4
+        # Reformat the prediction-aided result as a normal Layer 4 fix.
         position = result["position"]
         lat, lon, _ = ecef_to_lla(position[0], position[1], position[2])
 
@@ -453,16 +392,12 @@ class TrackManager:
             "t0_s": result["t0_s"],
         }
         
-        # Don't double count fixes received, but do process the solved fix
+        # Avoid double-counting the unsolved input while processing the solved fix.
         self.fixes_received -= 1
         return self.process_fix(solved_fix)
 
     def prune_stale(self) -> int:
-        """Remove tracks that have not received updates recently.
-
-        Returns:
-            Number of tracks pruned.
-        """
+        """Remove stale tracks and return the number pruned."""
         stale_keys = [
             icao for icao, track in self._tracks.items()
             if track.age_s > MAX_TRACK_AGE_S
@@ -481,7 +416,7 @@ class TrackManager:
         return sum(1 for t in self._tracks.values() if t.is_established)
 
     def get_all_tracks(self) -> list[dict]:
-        """Get summary of all active tracks for status reporting."""
+        """Return summaries of all active established tracks for status reporting."""
         result = []
         for icao, track in self._tracks.items():
             if track.is_established and len(track.positions) > 0:

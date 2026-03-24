@@ -1,34 +1,12 @@
-"""Correlation engine for grouping Mode-S receptions.
-
-Groups decoded Mode-S messages from multiple sensors that received the
-SAME transmission from the SAME aircraft at nearly the SAME time.
-
-Correlation key: (ICAO address, raw message content)
-  - Same ICAO = same aircraft
-  - Same raw_msg = same transmission (identical radio frame)
-
-Time window: configurable, default 2ms (2,000,000 ns)
-  - Airsquitter sensors have 30ns GPS sync
-  - Max propagation delay across 50km baseline ≈ 167µs
-  - 2ms provides comfortable margin
-
-References:
-  - MLAT_Verified_Combined_Reference.md Part 3.3 (Layer 3 spec)
-  - Workshop tips: "Group messages from different sensors"
-  - Previous run stats: 156K groups formed, 101K dropped (< 3 receptions)
-"""
+"""Group decoded Mode-S receptions into time-windowed correlation sets."""
 
 from __future__ import annotations
 
 
-# Default correlation window: 2ms in nanoseconds
-# Max propagation delay for 50km sensor baseline ≈ 167µs
-# GPS sync precision: 30ns (Jetvision Airsquitter)
+# Use a 2 ms correlation window in nanoseconds to cover propagation and sync error.
 DEFAULT_WINDOW_NS = 2_000_000
 
-# Minimum receptions to emit a group
-# 2 = enables 2-sensor semi-multilateration (differentiating feature)
-# 3 = standard MLAT minimum
+# Emit groups with at least two receptions so 2-sensor MLAT remains possible.
 DEFAULT_MIN_RECEPTIONS = 2
 
 
@@ -115,11 +93,7 @@ class CorrelationGroup:
 
 
 class Correlator:
-    """Time-windowed correlation engine using Python dicts.
-
-    Groups decoded Mode-S packets by (ICAO, raw_msg) key within a
-    configurable time window. Emits groups when the window expires.
-    """
+    """Correlate decoded Mode-S packets by `(icao, raw_msg)` within a time window."""
 
     def __init__(
         self,
@@ -129,26 +103,17 @@ class Correlator:
         self.window_ns = window_ns
         self.min_receptions = min_receptions
 
-        # Active groups: keyed by (icao, raw_msg) -> CorrelationGroup
+        # Store active groups keyed by `(icao, raw_msg)`.
         self._buffer: dict[tuple[str, str], CorrelationGroup] = {}
 
-        # Stats
+        # Track correlation statistics.
         self.groups_formed = 0
         self.groups_emitted = 0
         self.groups_dropped = 0
         self.messages_processed = 0
 
     def process(self, packet: dict) -> list[dict]:
-        """Process a decoded packet from Layer 2.
-
-        Args:
-            packet: Decoded JSONL dict with fields:
-                icao, df_type, altitude_ft, squawk, raw_msg,
-                sensor_id, lat, lon, alt, timestamp_s, timestamp_ns
-
-        Returns:
-            List of completed correlation groups (may be empty).
-        """
+        """Process one decoded packet and return any completed correlation groups."""
         self.messages_processed += 1
 
         icao = packet.get("icao")
@@ -169,21 +134,21 @@ class Correlator:
 
         current_time_ns = reception.abs_time_ns
 
-        # First, flush any expired groups
+        # Flush groups whose time window has already expired.
         emitted = self._flush_expired(current_time_ns)
 
-        # Look up or create group for this (icao, raw_msg)
+        # Look up or create the group for this `(icao, raw_msg)` key.
         key = (icao, raw_msg)
         group = self._buffer.get(key)
 
         if group is not None:
-            # Check if this reception is within the time window
+            # Accept the reception only if it still falls inside the group window.
             if current_time_ns - group.first_time_ns <= self.window_ns:
-                # Skip duplicate sensor in same group
+                # Ignore duplicate sensors within the same group.
                 if not group.has_sensor(sensor_id):
                     group.receptions.append(reception)
             else:
-                # Window expired for this specific key; emit old, start new
+                # Emit the expired group for this key and start a fresh one.
                 emitted.extend(self._emit_group(key))
                 self._start_new_group(key, packet, reception)
         else:

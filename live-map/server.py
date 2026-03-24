@@ -1,29 +1,5 @@
 #!/usr/bin/env python3
-"""Layer 6: Live Map — FastAPI WebSocket backend.
-
-Reads Layer 5 JSONL track updates from stdin and broadcasts them
-to connected WebSocket clients for real-time map visualization.
-
-Architecture (from MLAT_Verified_Combined_Reference.md Part 14):
-    Sensor Data -> FastAPI Backend -> WebSocket -> Browser (MapLibre + Deck.gl)
-
-The server maintains the latest state of all active aircraft tracks
-and pushes updates to connected clients at configurable intervals.
-
-Usage:
-    Full pipeline (Layer 1 → 2 → 3 → 4 → 5 → 6):
-    ./data-pipe/mlat-pipe | python3 modes-decoder/main.py | \\
-        python3 correlation-engine/main.py | python3 mlat-solver/main.py | \\
-        python3 track-builder/main.py | python3 live-map/server.py
-
-    Or replay from saved Layer 5 output:
-    cat track_data.jsonl | python3 live-map/server.py
-
-References:
-  - MLAT_Verified_Combined_Reference.md Part 3.3 (Layer 6 spec)
-  - MLAT_Verified_Combined_Reference.md Part 5.2 (Stack: FastAPI + MapLibre + Deck.gl)
-  - MLAT_Verified_Combined_Reference.md Part 14 (Deck.gl guidance)
-"""
+"""Serve the Layer 6 live map over FastAPI and WebSockets from Layer 5 JSONL."""
 
 from __future__ import annotations
 
@@ -45,15 +21,15 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-# Add parent directory to sys.path to access mlat-solver modules
+# Add the solver directory to the import path for shared geo helpers.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "mlat-solver"))
 from gdop import compute_gdop
 from geo import lla_to_ecef
 
-# Cache for GDOP grid
+# Cache the generated GDOP grid.
 _gdop_grid_cache = None
 
-# Server configuration
+# Read server configuration from environment variables.
 HOST = os.environ.get("MLAT_MAP_HOST", "0.0.0.0")
 PORT = int(os.environ.get("MLAT_MAP_PORT", "8080"))
 UPDATE_INTERVAL_S = float(os.environ.get("MLAT_UPDATE_INTERVAL", "1.0"))
@@ -81,24 +57,21 @@ async def _periodic_prune() -> None:
 
 app = FastAPI(title="MLAT Live Map", version="1.0.0", lifespan=lifespan)
 
-# Mount static files for the frontend
+# Mount the static frontend assets.
 static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 
-# ── Shared state ───────────────────────────────────────────────────────
+# Shared state.
 
 class AircraftStore:
-    """Thread-safe store for current aircraft track states.
-
-    Updated by the stdin reader thread, read by the WebSocket broadcaster.
-    """
+    """Store current aircraft track state in a thread-safe container."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        # Current state of each aircraft keyed by ICAO
+        # Store current aircraft state keyed by ICAO.
         self._aircraft: dict[str, dict] = {}
-        # Track position history keyed by ICAO
+        # Store position history keyed by ICAO.
         self._trails: dict[str, list[list[float]]] = {}
         self._last_update = 0.0
         self.messages_received = 0
@@ -114,7 +87,7 @@ class AircraftStore:
             self._last_update = time.time()
             self.messages_received += 1
 
-            # Maintain trail history (last 50 positions)
+            # Keep only the most recent 50 trail points.
             lat = track.get("lat")
             lon = track.get("lon")
             if lat is not None and lon is not None:
@@ -158,7 +131,7 @@ class AircraftStore:
 store = AircraftStore()
 
 
-# ── WebSocket management ──────────────────────────────────────────────
+# WebSocket management.
 
 class ConnectionManager:
     """Manages active WebSocket connections."""
@@ -188,7 +161,7 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-# ── Routes ────────────────────────────────────────────────────────────
+# Routes.
 
 @app.get("/", response_class=HTMLResponse)
 async def index() -> HTMLResponse:
@@ -226,7 +199,7 @@ async def get_gdop_grid() -> dict:
     ])
     
     grid = []
-    # 20x20 grid over Cornwall bounds
+    # Evaluate a 20x20 grid across the Cornwall bounds.
     lat_min, lat_max = 49.8, 50.8
     lon_min, lon_max = -6.5, -4.5
     steps = 20
@@ -251,18 +224,14 @@ async def get_gdop_grid() -> dict:
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
-    """WebSocket endpoint for real-time aircraft updates.
-
-    Sends the current aircraft snapshot to the client at regular
-    intervals (default 1 second, configurable via MLAT_UPDATE_INTERVAL).
-    """
+    """Stream real-time aircraft snapshots to one WebSocket client."""
     await manager.connect(ws)
     try:
-        # Send initial snapshot immediately
+        # Send the initial snapshot immediately.
         snapshot = store.get_snapshot()
         await ws.send_text(json.dumps(snapshot))
 
-        # Keep connection alive and send periodic updates
+        # Keep the connection alive with periodic snapshots.
         while True:
             await asyncio.sleep(UPDATE_INTERVAL_S)
             snapshot = store.get_snapshot()
@@ -273,14 +242,10 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         manager.disconnect(ws)
 
 
-# ── Stdin reader thread ───────────────────────────────────────────────
+# Stdin reader.
 
 def stdin_reader() -> None:
-    """Read JSONL track updates from stdin in a background thread.
-
-    This runs in a separate thread so the FastAPI event loop
-    remains responsive for WebSocket connections.
-    """
+    """Read Layer 5 JSONL updates from stdin in a background thread."""
     log("Stdin reader started — waiting for Layer 5 JSONL input")
     try:
         for line in sys.stdin:
@@ -298,14 +263,14 @@ def stdin_reader() -> None:
     log("Stdin reader finished")
 
 
-# ── Logging ───────────────────────────────────────────────────────────
+# Logging.
 
 def log(msg: str) -> None:
     """Log to stderr."""
     print(msg, file=sys.stderr, flush=True)
 
 
-# ── Main ──────────────────────────────────────────────────────────────
+# Main.
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="MLAT Live Map Server (Layer 6)")
@@ -325,11 +290,11 @@ def main() -> None:
     log(f"Update interval: {UPDATE_INTERVAL_S}s")
     log(f"Server: http://{args.host}:{args.port}")
 
-    # Start stdin reader in background thread
+    # Start the stdin reader in a background thread.
     reader_thread = threading.Thread(target=stdin_reader, daemon=True)
     reader_thread.start()
 
-    # Start FastAPI server
+    # Start the FastAPI server.
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 

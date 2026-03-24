@@ -1,118 +1,139 @@
-# MLAT - Multilateration System
+# MLAT - Multilateration Pipeline
 
-Aircraft localization using Time Difference of Arrival (TDOA) from Neuron's 4DSky sensor network.
+Real-time and replayable multilateration pipeline for Mode-S and ADS-B data from Neuron's 4DSky network. The repository is split into six layers that exchange JSONL over stdin and stdout, so you can capture upstream data once and replay downstream stages repeatedly.
 
-Built for the Hedera Hello Future Apex Hackathon.
+## Repository Layout
 
-## Prerequisites
+| Layer | Directory | Language | Role |
+|---|---|---|---|
+| 1 | `data-pipe` | Go | Buyer node that receives raw seller packets from the Neuron network |
+| 2 | `modes-decoder` | Python | Decodes raw Mode-S hex into ICAO, DF, altitude, and squawk |
+| 3 | `correlation-engine` | Python | Groups same-aircraft same-frame receptions across sensors |
+| 4 | `mlat-solver` | Python | Applies overrides, clock correction, cache seeding, and MLAT solving |
+| 5 | `track-builder` | Python | Builds EKF-smoothed tracks and prediction-aids some 2-sensor groups |
+| 6 | `live-map` | Python + browser JS | FastAPI/WebSocket backend with MapLibre GL JS + Deck.gl frontend |
 
-- **Go 1.21+** — to build the data pipe
-- **Python 3.10+** — for decoder, correlator, solver, tracker, and live map
-- **Oracle Cloud VM with WireGuard** — provides a public IP (`161.118.172.83`) with port forwarding so the buyer node is reachable by sellers. The pipeline runs locally and tunnels through WireGuard.
-- **UDP buffer tuning** — the QUIC transport needs large buffers:
-  ```bash
-  sudo sysctl -w net.core.rmem_max=7500000
-  sudo sysctl -w net.core.wmem_max=7500000
-  ```
+## Current Behavior
 
-## Quick Start
+- `./run-pipeline.sh` runs only Layers 1 → 3 and writes `data-pipe/correlation_groups.jsonl`.
+- Layer 4 consumes Layer 3 groups, solves what it can, and also forwards some unresolved 2-sensor altitude groups as `unsolved_group` records for Layer 5.
+- Layer 5 smooths solved fixes, derives kinematics, and can recover some unresolved 2-sensor cases using established-track prediction.
+- Layer 6 is a FastAPI server plus a static HTML and JavaScript frontend. It is not React.
+- All stages keep `stdout` machine-readable and write logs and stats to `stderr`.
 
-### 1. Configure credentials
+## Requirements
 
-Place your `buyer-env` file in the project root with the following keys:
+- **Go 1.23+** for `data-pipe` (`go.mod` currently targets `go 1.23.2`)
+- **Python 3.10+** for Layers 2–6
+- **Neuron buyer credentials and seller public keys**
+- **A machine reachable by sellers** or equivalent forwarding and tunnel setup for the buyer node
+- **Optional QUIC buffer tuning** if your kernel limits are too low:
 
+```bash
+sudo sysctl -w net.core.rmem_max=7500000
+sudo sysctl -w net.core.wmem_max=7500000
 ```
-eth_rpc_url=https://testnet.hashio.io/api
-hedera_evm_id=<your_evm_id>
-hedera_id=<your_hedera_id>
-location={"lat":28.4675,"lon":77.2840,"alt":0.000000}
-mirror_api_url=https://testnet.mirrornode.hedera.com/api/v1
-private_key=<your_private_key>
-smart_contract_address=<your_contract_address>
-list_of_sellers=<comma_separated_seller_public_keys>
+
+## Install Dependencies
+
+### Go
+
+```bash
+go build -o data-pipe/mlat-pipe ./data-pipe
+```
+
+### Python
+
+The safest install is the combined one, because `track-builder` and `live-map` import shared modules from `mlat-solver`:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install --upgrade pip
+python3 -m pip install \
+  -r modes-decoder/requirements.txt \
+  -r mlat-solver/requirements.txt \
+  -r track-builder/requirements.txt \
+  -r live-map/requirements.txt
+```
+
+Current per-directory requirements:
+
+| Directory | Packages |
+|---|---|
+| `modes-decoder` | `pyModeS` |
+| `mlat-solver` | `numpy`, `scipy`, `numba` |
+| `track-builder` | `numpy`, `scipy` |
+| `live-map` | `fastapi`, `uvicorn`, `websockets` |
+
+## Configure Credentials and Sensor Overrides
+
+The repo currently keeps buyer credentials in the root-level `buyer-env` file. Replace it with your own values and keep the `data-pipe` links pointed at it:
+
+```bash
+ln -sf ../buyer-env data-pipe/.buyer-env
+ln -sf ../buyer-env data-pipe/.env
+```
+
+Expected keys:
+
+```text
+eth_rpc_url=...
+hedera_evm_id=...
+hedera_id=...
+location={"lat":...,"lon":...,"alt":...}
+mirror_api_url=...
+private_key=...
+smart_contract_address=...
+list_of_sellers=<comma-separated seller public keys>
 port=61339
 buyer_or_seller=buyer
 ```
 
-Then create symlinks in `data-pipe/`:
+The repo already includes `data-pipe/location-overrides.txt`, which is the current Cornwall sensor override map used by the solver. Replace it if you are running against a different deployment. Each entry is a JSON object with `public_key`, `lat`, `lon`, `alt`, and `name`.
 
-```bash
-cd data-pipe
-ln -sf ../buyer-env .buyer-env
-ln -sf ../buyer-env .env
-```
+> **Critical SDK gotcha:** the Neuron SDK parses some flags during `init()`, before environment files are loaded, so `--port`, `--buyer-or-seller`, `--mode`, `--list-of-sellers-source`, and `--envFile` must be supplied on the command line. `run-pipeline.sh` handles that for Layers 1 → 3.
 
-### 2. Set up location overrides
+## Run the Pipeline
 
-Place `location-overrides.txt` in `data-pipe/`. This is a JSON array of corrected sensor positions (sellers report slightly offset locations for privacy):
-
-```json
-[
-  {"name": "ne073 Penzance", "lat": 50.0992, "lon": -5.5567, "alt": 153.8, "public_key": "..."},
-  ...
-]
-```
-
-The solver matches each `sensor_id` to an override by geographic proximity and replaces lat/lon/alt before solving.
-
-### 3. Build the data pipe
-
-```bash
-cd data-pipe
-go build -o mlat-pipe .
-```
-
-### 4. Run the full pipeline
+### Capture Layer 3 correlation groups
 
 ```bash
 ./run-pipeline.sh
 ```
 
-This script reads the port from `.buyer-env` and passes all required CLI flags. Output goes to `data-pipe/correlation_groups.jsonl`. Logs go to `data-pipe/pipe.log`, `decoder.log`, and `correlator.log`.
+This builds the live stream through Layers 1 → 3 and writes:
 
-To run the solver on captured data:
+- `data-pipe/correlation_groups.jsonl`
+- `data-pipe/pipe.log`
+- `decoder.log`
+- `correlator.log`
 
-```bash
-cat data-pipe/correlation_groups.jsonl | python3 mlat-solver/main.py 2>solver.log > solved.jsonl
-```
+### Replay Layers 4 → 6 from captured Layer 3 data
 
-### 5. Verify
-
-Check `pipe.log` for `NEW STREAM from seller:` lines — you should see one per connected seller. Check `Active sensor connections:` for the count.
-
-> **Critical SDK Gotcha:** The Neuron SDK's `init()` function parses `pflag` CLI flags and checks `--port` **before** `main()` runs. The env file is loaded later via `godotenv` and only sets OS env vars — pflag never sees them. Therefore `--port`, `--buyer-or-seller`, `--mode`, `--list-of-sellers-source`, and `--envFile` **must** be passed as command-line arguments. The `run-pipeline.sh` script handles this automatically.
-
-## Architecture
-
-| Layer | Component | Language | Description |
-|-------|-----------|----------|-------------|
-| 1 | Data Pipe | Go | Connects to Neuron 4DSky network, receives raw Mode-S packets |
-| 2 | Mode-S Decoder | Python | Decodes raw bytes using pyModeS: ICAO, altitude, DF type |
-| 3 | Correlation Engine | Python | Groups messages from 2+ sensors by ICAO + time window |
-| 4 | MLAT Solver | Python | Frisch TOA formulation with Inamdar algebraic init + location overrides |
-| 5 | Track Builder | Python | EKF for continuous flight track association |
-| 6 | Live Map | React | MapLibre GL JS + Deck.gl real-time visualization |
-
-## Layer 1: Data Pipe
-
-The Go data pipe connects to the Neuron 4DSky network as a buyer node using the `neuron-go-hedera-sdk`. It receives live Mode-S packets from distributed sensors via libp2p QUIC streams and outputs structured JSON to stdout.
-
-### Build
+Run just the solver:
 
 ```bash
-cd data-pipe
-go build -o mlat-pipe .
+cat data-pipe/correlation_groups.jsonl | python3 mlat-solver/main.py 2>solver.log > layer4.jsonl
 ```
 
-### Run
-
-Use the pipeline script (recommended):
+Build tracks from Layer 4 output:
 
 ```bash
-./run-pipeline.sh
+cat layer4.jsonl | python3 track-builder/main.py 2>tracker.log > layer5.jsonl
 ```
 
-Or run manually with all required CLI flags:
+Serve the live map from replayed data:
+
+```bash
+cat layer4.jsonl | python3 track-builder/main.py 2>tracker.log | python3 live-map/server.py 2>livemap.log
+```
+
+Then open `http://localhost:8080`.
+
+### Manual Layer 1 → 3 command
+
+If you do not want to use `run-pipeline.sh`, the equivalent command is:
 
 ```bash
 cd data-pipe
@@ -121,221 +142,140 @@ cd data-pipe
     --buyer-or-seller buyer \
     --mode peer \
     --list-of-sellers-source env \
-    --envFile .buyer-env
+    --envFile .buyer-env \
+    2>pipe.log \
+| python3 ../modes-decoder/main.py 2>../decoder.log \
+| python3 ../correlation-engine/main.py 2>../correlator.log \
+> correlation_groups.jsonl
 ```
 
-Requires `.buyer-env` symlink pointing to the `buyer-env` credentials file.
+## Layer 1: Data Pipe
 
-### Output Format
+`data-pipe/main.go` runs the Neuron buyer node, accepts seller libp2p streams, parses the binary wire format, and emits one JSON packet per received Mode-S frame.
 
-One JSON object per line (JSONL):
+Output fields:
+
+| Field | Description |
+|---|---|
+| `sensor_id` | Seller sensor identifier from the packet header |
+| `lat`, `lon`, `alt` | Seller-reported sensor position |
+| `timestamp_s`, `timestamp_ns` | Reception timestamp split into seconds and nanoseconds |
+| `raw_msg` | Raw Mode-S message as uppercase hex |
+
+Example:
 
 ```json
-{"sensor_id":1234,"lat":28.61,"lon":77.21,"alt":216.0,"timestamp_s":43200,"timestamp_ns":500000000,"raw_msg":"8da4c2b658b9..."}
+{"sensor_id":1234,"lat":50.12993,"lon":-5.5137,"alt":56.3,"timestamp_s":43200,"timestamp_ns":500000000,"raw_msg":"8DA4C2B658B9..."}
 ```
 
 ## Layer 2: Mode-S Decoder
 
-Decodes raw Mode-S hex messages from Layer 1 using [pyModeS](https://github.com/junzis/pyModeS). Extracts the ICAO aircraft address, Downlink Format type, barometric altitude, and squawk code.
+`modes-decoder/main.py` reads Layer 1 JSONL and enriches it with decoded Mode-S fields using `pyModeS`.
 
-### Supported Downlink Formats
+Current decoder behavior:
 
-| DF | Name | Fields Extracted |
-|----|------|-----------------|
-| 0 | Short Air-Air Surveillance | ICAO (via parity), altitude |
-| 4 | Surveillance Altitude Reply | ICAO (via parity), altitude |
-| 5 | Surveillance Identity Reply | ICAO (via parity), squawk |
-| 11 | All-Call Reply | ICAO (clear text) |
-| 16 | Long Air-Air Surveillance | ICAO (via parity), altitude |
-| 17 | ADS-B Extended Squitter | ICAO (clear text) |
-| 18 | TIS-B / ADS-R | ICAO (clear text) |
-| 20 | Comm-B Altitude Reply | ICAO (via parity), altitude |
-| 21 | Comm-B Identity Reply | ICAO (via parity), squawk |
+- Accepts both 56-bit and 112-bit Mode-S messages.
+- Decodes ICAO, DF type, squawk, and altitude when available.
+- Extracts altitude for DF0, DF4, DF16, and DF20 via the AC field.
+- Extracts airborne-position altitude for DF17 type codes 9–18 from the ADS-B ME field.
+- Logs rolling stats to `stderr` every 30 seconds.
 
-For DF4/5/20/21, the 24-bit ICAO address is recovered via `AP XOR CRC(payload)` as specified in ICAO Doc 9871. pyModeS handles this automatically.
+Currently handled DF types are 0, 4, 5, 11, 16, 17, 18, 20, and 21.
 
-### Install
+Output fields:
 
-```bash
-pip install -r modes-decoder/requirements.txt
-```
+| Field | Description |
+|---|---|
+| `icao` | Aircraft ICAO address |
+| `df_type` | Mode-S downlink format |
+| `altitude_ft` | Decoded altitude when present |
+| `squawk` | Decoded squawk for identity replies |
+| `raw_msg` | Original raw message |
+| `sensor_id`, `lat`, `lon`, `alt`, `timestamp_s`, `timestamp_ns` | Passed through from Layer 1 |
 
-### Run
-
-The full pipeline runs all layers together via `run-pipeline.sh`. To run just Layer 1 → 2:
-
-```bash
-cd data-pipe && ./mlat-pipe --port 61339 --buyer-or-seller buyer --mode peer --list-of-sellers-source env --envFile .buyer-env | python3 ../modes-decoder/main.py
-```
-
-Or replay from a saved file:
-
-```bash
-cat saved_data.jsonl | python3 modes-decoder/main.py
-```
-
-### Output Format
-
-One JSON object per line (JSONL):
+Example:
 
 ```json
-{"icao":"4CA7E8","df_type":4,"altitude_ft":36000,"squawk":null,"raw_msg":"2000171806A983","sensor_id":1001,"lat":50.1,"lon":-5.7,"alt":100.0,"timestamp_s":43200,"timestamp_ns":500000000}
+{"icao":"4CA7E8","df_type":17,"altitude_ft":36000,"squawk":null,"raw_msg":"8D4CA7E858B9...","sensor_id":1001,"lat":50.1,"lon":-5.7,"alt":100.0,"timestamp_s":43200,"timestamp_ns":500000000}
 ```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `icao` | string | 6-char hex ICAO aircraft address |
-| `df_type` | int | Downlink Format number |
-| `altitude_ft` | int\|null | Barometric altitude in feet (DF0/4/16/20 only) |
-| `squawk` | string\|null | 4-digit squawk code (DF5/21 only) |
-| `raw_msg` | string | Original hex message (uppercase) |
-| `sensor_id` | int | Sensor that received this message |
-| `lat` | float | Sensor latitude |
-| `lon` | float | Sensor longitude |
-| `alt` | float | Sensor altitude |
-| `timestamp_s` | int | Reception time (seconds since midnight) |
-| `timestamp_ns` | int | Reception time (nanosecond component) |
-
-Logs and statistics are written to stderr every 30 seconds.
 
 ## Layer 3: Correlation Engine
 
-Groups decoded Mode-S messages from multiple sensors that received the **same transmission** from the **same aircraft** at nearly the **same time**. Uses Python dicts with time-windowed correlation.
+`correlation-engine/main.py` groups receptions that are from the same aircraft and the same radio frame and that arrive within a configured time window.
 
-### How It Works
+Current behavior:
 
-1. Messages are keyed by `(ICAO, raw_msg)` — same aircraft, same radio frame
-2. Receptions arriving within a configurable time window (default 2ms) are grouped together
-3. Groups are emitted when the window expires
-4. Groups below the minimum reception count are dropped
-
-**Time window rationale:** Airsquitter sensors have 30ns GPS sync. Max propagation delay across a 50km baseline ≈ 167µs. The default 2ms window provides comfortable margin.
-
-### Configuration
+- Correlation key: `(icao, raw_msg)`
+- Default window: `MLAT_WINDOW_MS=2.0`
+- Default minimum group size: `MLAT_MIN_RECEPTIONS=2`
+- Flushes complete groups as JSONL and prints stats to `stderr` every 30 seconds
 
 Environment variables:
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+|---|---|---|
 | `MLAT_WINDOW_MS` | `2.0` | Correlation window in milliseconds |
-| `MLAT_MIN_RECEPTIONS` | `2` | Minimum sensors per group (2 enables semi-MLAT) |
+| `MLAT_MIN_RECEPTIONS` | `2` | Minimum sensors required before emitting a group |
 
-### Run
-
-Full pipeline (Layer 1 → 2 → 3) — use `./run-pipeline.sh` for the recommended approach, or manually:
-
-```bash
-cd data-pipe && ./mlat-pipe --port 61339 --buyer-or-seller buyer --mode peer --list-of-sellers-source env --envFile .buyer-env | python3 ../modes-decoder/main.py | python3 ../correlation-engine/main.py
-```
-
-Or replay from saved Layer 2 output:
-
-```bash
-cat decoded_data.jsonl | python3 correlation-engine/main.py
-```
-
-### Output Format
-
-One JSON object per line (JSONL):
+Output shape:
 
 ```json
-{"icao":"4CA7E8","df_type":4,"altitude_ft":36000,"squawk":null,"raw_msg":"2000171806A983","num_sensors":3,"receptions":[{"sensor_id":1001,"lat":50.1,"lon":-5.7,"alt":100.0,"timestamp_s":43200,"timestamp_ns":500000000},{"sensor_id":1002,"lat":50.2,"lon":-5.6,"alt":105.0,"timestamp_s":43200,"timestamp_ns":500000050},{"sensor_id":1003,"lat":50.3,"lon":-5.5,"alt":110.0,"timestamp_s":43200,"timestamp_ns":500000100}]}
+{"icao":"4CA7E8","df_type":17,"altitude_ft":36000,"squawk":null,"raw_msg":"8D4CA7E858B9...","num_sensors":3,"receptions":[{"sensor_id":1001,"lat":50.1,"lon":-5.7,"alt":100.0,"timestamp_s":43200,"timestamp_ns":500000000},{"sensor_id":1002,"lat":50.2,"lon":-5.6,"alt":105.0,"timestamp_s":43200,"timestamp_ns":500000050},{"sensor_id":1003,"lat":50.3,"lon":-5.5,"alt":110.0,"timestamp_s":43200,"timestamp_ns":500000100}]}
 ```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `icao` | string | 6-char hex ICAO aircraft address |
-| `df_type` | int | Downlink Format number |
-| `altitude_ft` | int\|null | Barometric altitude in feet |
-| `squawk` | string\|null | 4-digit squawk code |
-| `raw_msg` | string | Original hex message |
-| `num_sensors` | int | Number of sensors in this group |
-| `receptions` | array | List of per-sensor receptions |
-
-Each reception contains: `sensor_id`, `lat`, `lon`, `alt`, `timestamp_s`, `timestamp_ns`.
-
-Logs and statistics are written to stderr every 30 seconds.
 
 ## Layer 4: MLAT Solver
 
-Computes aircraft positions from correlation groups using Time Difference of Arrival (TDOA). Implements the Frisch TOA formulation with Inamdar algebraic initialization, Markochev atmospheric refraction correction, and Huber-loss outlier robustness.
+`mlat-solver/main.py` is the highest-leverage stage in the repo. It does more than geometric solving:
 
-### Solver Pipeline (Part 20)
+- Loads `data-pipe/location-overrides.txt` and replaces seller-reported coordinates with corrected sensor positions.
+- Uses ADS-B DF17 position and velocity messages to seed a per-ICAO cache.
+- Maintains receiver-pair clock calibration using ADS-B references.
+- Routes groups by sensor count into the appropriate solver path.
+- Emits solved fixes as normal Layer 4 records.
+- Also emits `{"unsolved_group": ...}` records for some 2-sensor altitude groups so Layer 5 can try prediction-aided recovery.
 
-1. **Route by sensor count:**
-   - 5+ sensors → Inamdar exact algebraic solution (no iteration needed)
-   - 4 sensors + altitude → Inamdar with altitude disambiguation
-   - 3 sensors + altitude → Constrained TDOA (determined system)
-   - 2 sensors → Skip (prediction-aided requires Layer 5 tracker)
-   - 0-1 sensors → Cannot solve
+Current solve routing:
 
-2. **Iterative refinement:** Frisch TOA formulation (`scipy.optimize.least_squares`)
-   - `method='trf'` (Trust Region Reflective)
-   - `loss='huber'` for outlier robustness (Part 21)
-   - Atmospheric refraction-corrected velocity per sensor pair (Markochev model)
+| Case | Current path |
+|---|---|
+| 5+ sensors | `inamdar_5sensor` init plus iterative refinement |
+| 4 sensors + altitude | `inamdar_4sensor_alt` |
+| 3 sensors + altitude | `constrained_3sensor` |
+| 2 sensors + altitude + prior | Prior-aided `solve_toa` |
+| 2 sensors + altitude without usable prior | Forwarded as `unsolved_group` |
 
-3. **Validation:**
-   - Position within 500 km of all sensors
-   - GDOP ≤ 20 (Part 4.3)
-   - Residual ≤ 10,000 m
-   - Altitude consistency check
+Current validation gates in `solver.py` include:
 
-### Key Innovation: Frisch TOA (Part 18)
+- Sensor range limit: 500 km
+- GDOP limit: 20.0
+- General residual limit: 10,000 m
+- Prior-aided 2-sensor residual limit: 200 m quality gate
+- Prior drift limits for prediction-aided cases
 
-Instead of forming pairwise TDOA equations (which loses information and introduces correlated noise), the solver keeps all N TOA equations and eliminates the unknown transmission time analytically:
+Solved output fields:
 
-```
-t0_hat(x) = mean(t_i - ||x - s_i|| / c_i)
-```
+| Field | Description |
+|---|---|
+| `icao`, `lat`, `lon`, `alt_ft` | Solved aircraft state |
+| `residual_m` | Solver residual reported for the solve |
+| `quality_residual_m` | Quality metric used downstream for filtering and EKF measurement noise |
+| `gdop` | Geometry score for the solve |
+| `num_sensors` | Sensors used in the solve |
+| `solve_method` | Method label such as `inamdar_5sensor` or `constrained_3sensor` |
+| `timestamp_s`, `timestamp_ns` | Reference reception timestamp |
+| `df_type`, `squawk`, `raw_msg`, `t0_s` | Metadata carried through from the correlation group |
 
-This reduces the problem from 4D (x, y, z, t0) to 3D (x, y, z).
-
-### Install
-
-```bash
-pip install -r mlat-solver/requirements.txt
-```
-
-### Run
-
-Full pipeline (Layer 1 → 2 → 3 → 4) — use `./run-pipeline.sh` to capture Layer 3 output, then:
-
-```bash
-cat data-pipe/correlation_groups.jsonl | python3 mlat-solver/main.py 2>solver.log > solved.jsonl
-```
-
-Or replay from saved Layer 3 output:
-
-```bash
-cat correlated_groups.jsonl | python3 mlat-solver/main.py
-```
-
-### Output Format
-
-One JSON object per line (JSONL):
+Solved example:
 
 ```json
-{"icao":"4CA7E8","lat":50.15,"lon":-5.5,"alt_ft":36000.0,"residual_m":1.31,"gdop":4.5,"num_sensors":5,"solve_method":"inamdar_5sensor","timestamp_s":43200,"timestamp_ns":47198,"df_type":4,"squawk":null,"raw_msg":"2000171806A983","t0_s":43199.999999988}
+{"icao":"4CA7E8","lat":50.150000,"lon":-5.500000,"alt_ft":36000.0,"residual_m":24.8,"quality_residual_m":24.8,"gdop":4.5,"num_sensors":5,"solve_method":"inamdar_5sensor","timestamp_s":43200,"timestamp_ns":47198,"df_type":17,"squawk":null,"raw_msg":"8D4CA7E858B9...","t0_s":43199.999999988}
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `icao` | string | 6-char hex ICAO aircraft address |
-| `lat` | float | Solved latitude (WGS84) |
-| `lon` | float | Solved longitude (WGS84) |
-| `alt_ft` | float | Altitude in feet (from Mode-S or solved) |
-| `residual_m` | float | RMS residual in meters |
-| `gdop` | float | Geometric Dilution of Precision |
-| `num_sensors` | int | Number of sensors used |
-| `solve_method` | string | Algorithm used for initialization |
-| `timestamp_s` | int | Reference reception time (seconds) |
-| `timestamp_ns` | int | Reference reception time (nanoseconds) |
-| `df_type` | int | Downlink Format number |
-| `squawk` | string\|null | 4-digit squawk code |
-| `raw_msg` | string | Original hex message |
-| `t0_s` | float | Estimated transmission time (seconds) |
+Forwarded 2-sensor example:
 
-Logs and statistics are written to stderr every 30 seconds.
+```json
+{"unsolved_group":{"icao":"4CA7E8","num_sensors":2,"receptions":[...]}}
+```
 
 ### Module Structure
 
@@ -343,172 +283,92 @@ Logs and statistics are written to stderr every 30 seconds.
 |--------|-------------|-----------|
 | `geo.py` | WGS84 ↔ ECEF coordinate conversions | — |
 | `atmosphere.py` | Markochev atmospheric refraction model | Part 13.2 |
-| `gdop.py` | GDOP computation | Part 4.3, Part 22 |
-| `inamdar.py` | Algebraic TDOA initialization | Part 19 |
-| `frisch.py` | Frisch TOA iterative refinement | Part 18, Part 22 |
-| `solver.py` | Full pipeline routing + validation | Part 20 |
-| `main.py` | stdin/stdout JSONL entry point | — |
+| `gdop.py` | GDOP computation |
+| `inamdar.py` | Algebraic initializers for altitude-constrained cases |
+| `frisch.py` | Frisch TOA refinement and constrained 3-sensor solve |
+| `clock_sync.py` | Receiver-pair offset and drift calibration |
+| `adsb_decoder.py` | DF17 CPR position and velocity helpers |
+| `position_cache.py` | Per-ICAO cache for position and velocity priors |
+| `solver.py` | Routing, validation, and solve packaging |
+| `main.py` | Layer 4 stdin and stdout entrypoint |
 
 ## Layer 5: Track Builder
 
-Filters and smooths MLAT position fixes into continuous aircraft tracks using a custom Extended Kalman Filter (EKF). Associates incoming fixes by ICAO address and maintains per-aircraft track state with position history and derived kinematics.
+`track-builder/main.py` consumes the mixed Layer 4 stream, updates EKF-backed per-ICAO tracks, and emits smoothed track updates.
 
-### Extended Kalman Filter (Part 22)
+Current behavior:
 
-- **State vector:** `[x, y, z, vx, vy, vz]` — position + velocity in ECEF meters
-- **Motion model:** Constant-velocity with process noise acceleration σ = 5.0 m/s²
-- **Measurement model:** Direct position observation with σ = 200 m per axis
-- **Innovation gating:** Mahalanobis distance check — rejects fixes with χ²₃ > 14.16 (99.7% confidence, 3-DOF)
-- **Max prediction gap:** 60 seconds — track is reset if gap exceeds this
+- Maintains one 6-state constant-velocity EKF per ICAO.
+- Accepts normal solved Layer 4 fixes.
+- Intercepts `unsolved_group` records and attempts `prediction_aided_2sensor` recovery when an established track exists.
+- Derives EKF measurement noise from `quality_residual_m * gdop`, clamped into a bounded range.
+- Prunes stale tracks every 60 seconds and removes tracks older than 300 seconds.
 
-### Track Lifecycle
+Derived fields in each emitted track update:
 
-1. **Create:** New track initialized on first fix for an ICAO address
-2. **Update:** Subsequent fixes run EKF predict → gate → update cycle
-3. **Establish:** Track considered reliable after ≥ 2 accepted updates
-4. **Prune:** Tracks with no updates for > 300 seconds are removed
+| Field | Description |
+|---|---|
+| `heading_deg` | Ground-track heading |
+| `speed_kts` | Ground speed |
+| `vrate_fpm` | Vertical rate |
+| `track_quality` | Number of accepted EKF updates |
+| `positions_count` | Stored point count for the track |
+| `cov_matrix` | 2x2 local ENU covariance matrix used by the live map |
 
-### Derived Quantities
-
-Computed from the EKF velocity state at each update:
-
-| Quantity | Unit | Description |
-|----------|------|-------------|
-| `heading_deg` | degrees | Ground track heading (0° = North, clockwise) |
-| `speed_kts` | knots | Ground speed |
-| `vrate_fpm` | ft/min | Vertical rate |
-
-### Install
-
-```bash
-pip install -r track-builder/requirements.txt
-```
-
-### Run
-
-Full pipeline (Layer 1 → 2 → 3 → 4 → 5):
-
-```bash
-cat data-pipe/correlation_groups.jsonl | python3 mlat-solver/main.py | python3 track-builder/main.py
-```
-
-Or replay from saved Layer 4 output:
-
-```bash
-cat solved_positions.jsonl | python3 track-builder/main.py
-```
-
-### Output Format
-
-One JSON object per line (JSONL):
+Example output:
 
 ```json
-{"icao":"4CA7E8","lat":50.1596,"lon":-5.6404,"alt_ft":36000,"heading_deg":32.7,"speed_kts":2383.7,"vrate_fpm":23.0,"track_quality":2,"positions_count":2,"residual_m":120.5,"gdop":3.2,"num_sensors":4,"solve_method":"inamdar_4sensor_alt","timestamp_s":43201,"timestamp_ns":500000000,"df_type":4,"squawk":null,"raw_msg":"2000171806A984","t0_s":43201.000499833}
+{"icao":"4CA7E8","lat":50.159600,"lon":-5.640400,"alt_ft":36000,"heading_deg":32.7,"speed_kts":450.2,"vrate_fpm":-200,"track_quality":12,"positions_count":20,"residual_m":24.8,"quality_residual_m":24.8,"gdop":3.2,"num_sensors":4,"solve_method":"inamdar_4sensor_alt","timestamp_s":43201,"timestamp_ns":500000000,"df_type":17,"squawk":null,"raw_msg":"8D4CA7E858B9...","t0_s":43201.000499833,"cov_matrix":[[1200.0,15.0],[15.0,900.0]]}
 ```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `icao` | string | 6-char hex ICAO aircraft address |
-| `lat` | float | EKF-smoothed latitude (WGS84) |
-| `lon` | float | EKF-smoothed longitude (WGS84) |
-| `alt_ft` | float | Altitude in feet |
-| `heading_deg` | float | Ground track heading (degrees, 0=North) |
-| `speed_kts` | float | Ground speed (knots) |
-| `vrate_fpm` | float | Vertical rate (feet/min) |
-| `track_quality` | int | Number of accepted EKF updates for this track |
-| `positions_count` | int | Total positions in track history |
-| All Layer 4 fields | — | Passed through from the input fix |
-
-Logs and statistics are written to stderr every 30 seconds.
-
-### Module Structure
-
-| Module | Description | Reference |
-|--------|-------------|-----------|
-| `ekf.py` | Custom 6-state Extended Kalman Filter | Part 22 |
-| `tracker.py` | Per-ICAO track association and management | Part 3.2 |
-| `main.py` | stdin/stdout JSONL entry point | — |
 
 ## Layer 6: Live Map
 
-Real-time web visualization of aircraft tracks using MapLibre GL JS + Deck.gl. A FastAPI backend reads Layer 5 output and broadcasts track state to connected browsers via WebSocket.
+`live-map/server.py` serves the browser UI and reads Layer 5 JSONL from `stdin` in a background thread.
 
-### Technology Stack (Part 5.2, Part 14)
+Current stack:
 
-| Component | Library | Version |
-|-----------|---------|---------|
-| Backend | FastAPI + uvicorn | 0.135.1 |
-| Map renderer | MapLibre GL JS | 5.20.2 |
-| Data layers | Deck.gl | 9.2.11 |
-| Real-time transport | WebSocket | — |
+| Component | Current implementation |
+|---|---|
+| Backend | FastAPI + `uvicorn` |
+| Frontend | Static `live-map/static/index.html` |
+| Map | MapLibre GL JS |
+| Rendering overlays | Deck.gl |
+| Push transport | WebSocket |
 
-### Architecture
+Current server behavior:
 
-```
-Layer 5 (JSONL stdout) → stdin → FastAPI Backend → WebSocket → Browser
-                                      ↓
-                              REST /api/aircraft (polling fallback)
-```
-
-### Visualization Layers
-
-| Deck.gl Layer | Purpose |
-|---------------|---------|
-| `ScatterplotLayer` | Aircraft positions colored by altitude |
-| `TextLayer` | ICAO address labels |
-| `PathLayer` | Flight trail history (last 50 positions) |
-| `ScatterplotLayer` | Sensor positions (Cornwall network) |
-
-### Altitude Color Coding
-
-| Color | Altitude Range |
-|-------|---------------|
-| Green | < 10,000 ft |
-| Cyan | 10,000 – 25,000 ft |
-| Purple | 25,000 – 35,000 ft |
-| Orange | > 35,000 ft |
-
-### Configuration
+- Stores the latest track per ICAO.
+- Keeps the last 50 trail points for each aircraft.
+- Broadcasts snapshot-style WebSocket updates every `MLAT_UPDATE_INTERVAL` seconds.
+- Prunes stale aircraft after 300 seconds.
+- Serves a precomputed Cornwall GDOP overlay from `/api/gdop_grid`.
 
 Environment variables:
 
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `MLAT_MAP_HOST` | `0.0.0.0` | Server bind address |
-| `MLAT_MAP_PORT` | `8080` | Server port |
-| `MLAT_UPDATE_INTERVAL` | `1.0` | WebSocket push interval (seconds) |
+|---|---|---|
+| `MLAT_MAP_HOST` | `0.0.0.0` | Default bind address |
+| `MLAT_MAP_PORT` | `8080` | Default bind port |
+| `MLAT_UPDATE_INTERVAL` | `1.0` | Seconds between WebSocket snapshot pushes |
 
-### Install
-
-```bash
-pip install -r live-map/requirements.txt
-```
-
-### Run
-
-Full pipeline (Layer 1 → 2 → 3 → 4 → 5 → 6):
+CLI flags:
 
 ```bash
-cat data-pipe/correlation_groups.jsonl | python3 mlat-solver/main.py | python3 track-builder/main.py | python3 live-map/server.py
+python3 live-map/server.py --host 0.0.0.0 --port 8080
 ```
 
-Or run with synthetic demo data (no pipeline required):
+There is currently no `--demo` mode in the code.
 
-```bash
-python3 live-map/server.py --demo
-```
+Endpoints:
 
-Then open `http://localhost:8080` in a browser.
+| Endpoint | Description |
+|---|---|
+| `GET /` | Main live map page |
+| `GET /api/aircraft` | Current snapshot of all aircraft |
+| `GET /api/gdop_grid` | Cornwall GDOP overlay grid |
+| `WS /ws` | Periodic snapshot stream |
 
-### Endpoints
-
-| Endpoint | Protocol | Description |
-|----------|----------|-------------|
-| `GET /` | HTTP | Main map page |
-| `GET /api/aircraft` | HTTP | Current aircraft state (JSON) |
-| `WS /ws` | WebSocket | Real-time aircraft updates |
-
-### WebSocket Message Format
+Snapshot payload shape:
 
 ```json
 {
@@ -524,6 +384,7 @@ Then open `http://localhost:8080` in a browser.
       "speed_kts": 450.2,
       "vrate_fpm": -200,
       "track_quality": 12,
+      "cov_matrix": [[1200.0, 15.0], [15.0, 900.0]],
       "trail": [[-5.70, 50.10], [-5.68, 50.12], [-5.65, 50.15]]
     }
   ],

@@ -1,16 +1,16 @@
-# Binaries
+# Ignore built binaries.
 mlat-pipe
 *.exe
 *.out
 
-# Environment files (contain secrets)
+# Ignore environment files that may contain secrets.
 .env
 *.env
 
-# Go
+# Ignore Go vendor output.
 vendor/
 
-# Python
+# Ignore Python caches and virtual environments.
 __pycache__/
 *.pyc
 *.pyo
@@ -18,25 +18,25 @@ __pycache__/
 venv/
 *.egg-info/
 
-# Node
+# Ignore frontend dependency and build directories.
 node_modules/
 dist/
 build/
 
-# OS
+# Ignore OS metadata files.
 .DS_Store
 Thumbs.db
 
-# IDE
+# Ignore editor metadata.
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# WireGuard
+# Ignore WireGuard config files.
 wg0.conf
 
-# MLAT Data & Logs
+# Ignore MLAT data artifacts and logs.
 *.json
 *.log
 location-overrides.txt

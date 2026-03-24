@@ -1,51 +1,25 @@
-"""Extended Kalman Filter for aircraft track building.
-
-Implements a constant-velocity EKF with state [x, y, z, vx, vy, vz]
-for continuous flight track association and filtering.
-
-The EKF maintains per-aircraft state estimates and covariances,
-predicting forward between measurements and updating with new
-MLAT position fixes from Layer 4.
-
-Innovation gating (Mahalanobis distance) rejects outlier measurements
-that are inconsistent with the predicted track state.
-
-References:
-  - MLAT_Verified_Combined_Reference.md Part 22 (Custom EKF)
-  - MLAT_Verified_Combined_Reference.md Part 21 (Innovation gating)
-  - MLAT_Verified_Combined_Reference.md Part 4.2 (2-sensor semi-MLAT)
-"""
+"""Implement the constant-velocity EKF used for aircraft track building."""
 
 from __future__ import annotations
 
 import numpy as np
 
 
-# Chi-squared threshold for 3-DOF at 99.7% confidence (3-sigma gate)
-# scipy.stats.chi2.ppf(0.997, df=3) ≈ 14.16
+# Use the 99.7% chi-squared gate for 3-DOF innovation rejection.
 CHI2_GATE_3DOF = 14.16
 
-# Maximum time gap (seconds) before resetting the filter
+# Reset or inflate the filter after long measurement gaps.
 MAX_PREDICT_GAP_S = 60.0
 
-# Process noise acceleration standard deviation (m/s^2)
-# Aircraft typically have accelerations < 5 m/s^2 in level flight
+# Use a 5 m/s² process-noise acceleration scale for typical aircraft motion.
 PROCESS_NOISE_ACCEL = 5.0
 
-# Measurement noise standard deviation (meters)
-# Based on typical MLAT residuals (median ~145m from reference stats)
+# Keep the default measurement-noise scale at 200 m.
 MEASUREMENT_NOISE_M = 200.0
 
 
 class AircraftEKF:
-    """Extended Kalman Filter for a single aircraft track.
-
-    State vector: [x, y, z, vx, vy, vz] in ECEF meters.
-    Measurement: [x, y, z] position from MLAT solver.
-
-    Uses a constant-velocity motion model with configurable
-    process noise and measurement noise.
-    """
+    """Track one aircraft with a constant-velocity ECEF Kalman filter."""
 
     __slots__ = (
         "x", "P", "last_timestamp_s", "updates", "innovations",
@@ -59,19 +33,12 @@ class AircraftEKF:
         process_accel: float = PROCESS_NOISE_ACCEL,
         meas_noise: float = MEASUREMENT_NOISE_M,
     ) -> None:
-        """Initialize EKF with first position measurement.
-
-        Args:
-            position: Initial [x, y, z] in ECEF meters.
-            timestamp_s: Measurement timestamp in seconds.
-            process_accel: Process noise acceleration (m/s^2).
-            meas_noise: Measurement noise std dev (meters).
-        """
-        # State: [x, y, z, vx, vy, vz]
+        """Initialize the filter from the first position measurement."""
+        # Store the `[x, y, z, vx, vy, vz]` state vector.
         self.x = np.zeros(6)
         self.x[:3] = position
 
-        # Covariance: large initial uncertainty for velocity
+        # Start with large velocity uncertainty.
         self.P = np.eye(6)
         self.P[0, 0] = self.P[1, 1] = self.P[2, 2] = meas_noise ** 2
         self.P[3, 3] = self.P[4, 4] = self.P[5, 5] = 1e6  # unknown velocity
@@ -84,31 +51,22 @@ class AircraftEKF:
         self._meas_noise = meas_noise
 
     def predict(self, timestamp_s: float) -> np.ndarray:
-        """Predict state forward to the given timestamp.
-
-        Uses constant-velocity model: x_new = x + v * dt.
-
-        Args:
-            timestamp_s: Target time in seconds.
-
-        Returns:
-            Predicted position [x, y, z].
-        """
+        """Predict the state forward to the requested timestamp."""
         dt = timestamp_s - self.last_timestamp_s
         if dt <= 0:
             return self.x[:3].copy()
 
         if dt > MAX_PREDICT_GAP_S:
-            # Gap too large; keep state but inflate covariance
+            # Inflate covariance instead of trusting a stale prediction gap.
             self.P += np.eye(6) * 1e6
             self.last_timestamp_s = timestamp_s
             return self.x[:3].copy()
 
-        # State transition matrix F (constant velocity)
+        # Build the constant-velocity state-transition matrix.
         F = np.eye(6)
         F[0, 3] = F[1, 4] = F[2, 5] = dt
 
-        # Process noise Q using discrete white noise acceleration model
+        # Build the discrete white-noise acceleration covariance.
         q = self._process_accel ** 2
         dt2 = dt * dt
         dt3 = dt2 * dt / 2.0
@@ -121,7 +79,7 @@ class AircraftEKF:
             Q[i + 3, i] = dt3 * q   # velocity-position covariance
             Q[i + 3, i + 3] = dt2 * q  # velocity variance
 
-        # Predict
+        # Predict the next state and covariance.
         self.x = F @ self.x
         self.P = F @ self.P @ F.T + Q
         self.last_timestamp_s = timestamp_s
@@ -130,40 +88,25 @@ class AircraftEKF:
 
     def update(self, measurement: np.ndarray, timestamp_s: float,
                measurement_noise_m: float | None = None) -> float:
-        """Update state with a new position measurement.
-
-        Performs innovation gating (Mahalanobis distance check) and
-        rejects measurements that are too far from the prediction.
-
-        Args:
-            measurement: Position [x, y, z] in ECEF meters.
-            timestamp_s: Measurement timestamp in seconds.
-            measurement_noise_m: Per-axis measurement noise std dev (meters).
-                If provided, overrides the default MEASUREMENT_NOISE_M.
-                Typically derived from solver residual and GDOP.
-
-        Returns:
-            Mahalanobis distance of the innovation. Returns -1.0 if
-            the measurement was rejected by the gate.
-        """
-        # First predict to the measurement time
+        """Update the filter with a position measurement and innovation gate."""
+        # Predict to the measurement time first.
         self.predict(timestamp_s)
 
-        # Observation matrix H: we observe position only
+        # Observe position directly with the linear measurement matrix.
         H = np.zeros((3, 6))
         H[0, 0] = H[1, 1] = H[2, 2] = 1.0
 
-        # Measurement noise covariance R
+        # Build the measurement-noise covariance.
         noise = measurement_noise_m if measurement_noise_m is not None else self._meas_noise
         R = np.eye(3) * (noise ** 2)
 
-        # Innovation (residual)
+        # Compute the innovation residual.
         y = measurement - H @ self.x
 
-        # Innovation covariance
+        # Compute the innovation covariance.
         S = H @ self.P @ H.T + R
 
-        # Mahalanobis distance for innovation gating (Part 21, Approach 3)
+        # Compute the Mahalanobis distance for innovation gating.
         try:
             S_inv = np.linalg.inv(S)
         except np.linalg.LinAlgError:
@@ -171,19 +114,19 @@ class AircraftEKF:
 
         mahalanobis_sq = float(y.T @ S_inv @ y)
 
-        # Gate check: reject if innovation is too large
+        # Reject innovations that exceed the chi-squared gate.
         if mahalanobis_sq > CHI2_GATE_3DOF:
             return -1.0
 
         mahalanobis = float(np.sqrt(mahalanobis_sq))
 
-        # Kalman gain
+        # Compute the Kalman gain.
         K = self.P @ H.T @ S_inv
 
-        # State update
+        # Apply the state update.
         self.x = self.x + K @ y
 
-        # Covariance update (Joseph form for numerical stability)
+        # Update covariance with the Joseph-stabilized form.
         I_KH = np.eye(6) - K @ H
         self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
 

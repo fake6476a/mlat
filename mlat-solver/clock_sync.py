@@ -1,25 +1,4 @@
-"""Clock synchronization for MLAT solver using ADS-B reference beacons.
-
-Implements pairwise receiver clock offset estimation inspired by
-mutability/mlat-server (clocktrack.py, clocksync.py, clocknorm.py).
-
-Core idea: ADS-B DF17 messages contain aircraft positions (CPR-encoded).
-When two receivers both see the same Mode-S message, the expected
-propagation delay to each receiver can be computed from the known
-aircraft position. The difference between measured timestamps minus
-expected delays gives the relative clock offset between receivers.
-
-For non-DF17 messages (where aircraft position is unknown), we apply
-the learned clock offsets to correct timestamps before solving.
-
-Architecture:
-    1. ClockPairing: tracks offset & drift between one pair of receivers
-    2. ClockCalibrator: manages all pairings, processes groups, corrects timestamps
-
-References:
-    - mutability/mlat-server clocktrack.py, clocksync.py, clocknorm.py
-    - Markochev S., Engineering Proceedings 2021, 13(1):12
-"""
+"""Estimate pairwise receiver clock offsets from ADS-B references for MLAT."""
 
 from __future__ import annotations
 
@@ -31,7 +10,7 @@ from collections import defaultdict
 import numpy as np
 
 from atmosphere import C_AIR
-from geo import lla_to_ecef
+from geo import sensor_lla_to_ecef
 
 # Minimum sync points before a pairing is considered valid
 MIN_SYNC_POINTS = 3
@@ -42,21 +21,15 @@ MAX_SYNC_AGE = 300.0
 # Outlier rejection threshold (multiples of current stddev)
 OUTLIER_SIGMA = 3.5
 
-# R3: Maximum consecutive outlier rejections before resetting the filter.
-# Handles clock steps (e.g., GPS lock changes) that would otherwise cause
-# permanent rejection. Inspired by mutability's 5-outlier counter.
+# Reset the filter after too many consecutive outliers so clock steps can re-lock.
 MAX_CONSECUTIVE_OUTLIERS = 5
 
 # Maximum allowed clock offset magnitude (seconds) — reject if larger
 MAX_CLOCK_OFFSET = 0.5
 
-# Kalman filter tuning parameters
-# Measurement noise variance (seconds²) — SDR timestamp jitter ~5μs → (5e-6)² = 25e-12
+# Define the Kalman measurement-noise variance in seconds squared.
 _R = 25e-12
-# Drift process noise spectral density (s/s²/Hz)
-# With message-timestamp dt (real seconds), this must be small enough that
-# Q contribution (q*dt³/3 for p00) stays reasonable over typical dt=1-10s.
-# SDR crystal Allan deviation ~1e-9 at τ=1s → PSD ~1e-18
+# Define the drift process-noise spectral density used by the Kalman filter.
 _Q_DRIFT = 1e-18
 
 
@@ -65,20 +38,7 @@ def _log(msg: str) -> None:
 
 
 class ClockPairing:
-    """Tracks the relative clock offset and drift between two receivers.
-
-    Uses a 2-state Kalman filter with state vector [offset, drift]:
-      - offset: clock difference in seconds (t_a_corrected - t_b_corrected)
-      - drift: rate of change of offset in seconds/second (PPM * 1e-6)
-
-    The Kalman filter provides:
-      - Optimal weighting of observations vs predictions
-      - Formal uncertainty via covariance matrix P
-      - Natural handling of measurement gaps (covariance grows during gaps)
-      - Built-in warm-up detection (high P[0,0] = high uncertainty)
-
-    Replaces the previous PI controller (R4 from MLAT_Accuracy_Analysis.md).
-    """
+    """Track relative clock offset and drift between one receiver pair."""
 
     __slots__ = (
         "sensor_a", "sensor_b",
@@ -107,16 +67,7 @@ class ClockPairing:
         self._consecutive_outliers = 0
 
     def update(self, measured_offset: float, now: float) -> bool:
-        """Add a new sync observation and update the offset/drift estimate.
-
-        Args:
-            measured_offset: (t_a - delay_a) - (t_b - delay_b) in seconds.
-                A positive value means sensor_b's clock is ahead of sensor_a.
-            now: message timestamp (seconds) for dt computation and aging.
-
-        Returns:
-            True if the observation was accepted, False if rejected as outlier.
-        """
+        """Update the offset and drift estimate from one sync observation."""
         dt = now - self.last_update if self.last_update > 0 else 0.0
 
         if self.n == 0:
@@ -131,13 +82,10 @@ class ClockPairing:
             self.last_update = now
             return True
 
-        # --- Predict step ---
-        # State prediction: offset += drift * dt
+        # Predict the next offset from the current drift.
         self.offset += self.drift * dt
 
-        # Covariance prediction: P = F P F' + Q
-        # F = [[1, dt], [0, 1]]
-        # Q = q_drift * [[dt³/3, dt²/2], [dt²/2, dt]]  (constant-velocity model)
+        # Predict covariance with the constant-velocity Kalman model.
         old_p00 = self.p00
         old_p01 = self.p01
         old_p11 = self.p11
@@ -154,8 +102,7 @@ class ClockPairing:
         if self.valid and self.n >= MIN_SYNC_POINTS:
             if abs(innovation) > OUTLIER_SIGMA * (S ** 0.5):
                 self._consecutive_outliers += 1
-                # R3: After too many consecutive outliers, the clock has likely
-                # stepped. Reset the filter to re-acquire from scratch.
+                # Reset after repeated outliers because the clock has likely stepped.
                 if self._consecutive_outliers >= MAX_CONSECUTIVE_OUTLIERS:
                     self.n = 0
                     self.offset = measured_offset
@@ -174,16 +121,14 @@ class ClockPairing:
                 self.last_update = now
                 return False
 
-        # --- Update step ---
-        # Kalman gain: K = P H' / S, where H = [1, 0]
+        # Update the filter with the scalar observation model `H = [1, 0]`.
         k0 = self.p00 / S
         k1 = self.p01 / S
 
         self.offset += k0 * innovation
         self.drift += k1 * innovation
 
-        # Covariance update: Joseph form P = (I-KH)P(I-KH)' + KRK'
-        # For H=[1,0], K=[k0,k1]': (I-KH) = [[1-k0, 0], [-k1, 1]]
+        # Apply the Joseph-form covariance update for numerical stability.
         a = 1.0 - k0
         # new_p00 = a² * p00 + k0² * R
         new_p00 = a * a * self.p00 + k0 * k0 * r
@@ -205,11 +150,7 @@ class ClockPairing:
         return True
 
     def predict(self, now: float) -> float:
-        """Predict the current clock offset at time 'now'.
-
-        Returns:
-            Predicted offset in seconds.
-        """
+        """Predict the current clock offset at the requested time."""
         if not self.valid:
             return self.offset
         dt = now - self.last_update
@@ -217,15 +158,7 @@ class ClockPairing:
 
 
 class ClockCalibrator:
-    """Manages clock synchronization across all receiver pairs.
-
-    Uses ADS-B DF17 messages with known positions as reference beacons
-    to calibrate pairwise clock offsets. Then applies corrections to
-    correlation groups before they are passed to the solver.
-
-    This is equivalent to mutability/mlat-server's ClockTracker +
-    clocknorm.normalize() pipeline.
-    """
+    """Manage clock calibration across all receiver pairs in the current network."""
 
     def __init__(self) -> None:
         # Map of (sensor_a, sensor_b) -> ClockPairing where sensor_a < sensor_b
@@ -253,39 +186,27 @@ class ClockCalibrator:
         receptions: list[dict],
         now: float,
     ) -> None:
-        """Use a DF17 message with known position as a sync reference.
-
-        For each pair of receivers that saw this message, compute the
-        expected propagation delay and derive the clock offset.
-
-        Args:
-            aircraft_ecef: Known aircraft position in ECEF [x, y, z].
-            receptions: List of reception dicts with sensor_id, lat, lon, alt,
-                        timestamp_s, timestamp_ns.
-            now: Monotonic time for aging.
-        """
+        """Use a known ADS-B position to update pairwise receiver clock offsets."""
         n = len(receptions)
         if n < 2:
             return
 
-        # Compute reception-delay-corrected timestamps for each receiver
+        # Compute propagation-delay-corrected timestamps for each receiver.
         corrected = []
         for rec in receptions:
-            sensor_ecef = lla_to_ecef(rec["lat"], rec["lon"], rec["alt"])
+            sensor_ecef = sensor_lla_to_ecef(rec["lat"], rec["lon"], rec["alt"])
             distance = np.linalg.norm(aircraft_ecef - sensor_ecef)
             delay = distance / C_AIR  # propagation delay in seconds
             t_raw = rec["timestamp_s"] + rec["timestamp_ns"] * 1e-9
             t_corrected = t_raw - delay  # should be ≈ transmission time
             corrected.append((rec["sensor_id"], t_corrected))
 
-        # For each pair of receivers, the difference in corrected times
-        # is the clock offset
+        # Convert corrected timestamp differences into pairwise clock offsets.
         for i in range(n):
             for j in range(i + 1, n):
                 s_a, tc_a = corrected[i]
                 s_b, tc_b = corrected[j]
-                # offset = tc_a - tc_b
-                # if positive, sensor_b's clock is behind sensor_a
+                # A positive offset means sensor `b` is behind sensor `a`.
                 measured_offset = tc_a - tc_b
 
                 self.sync_points_total += 1
@@ -308,21 +229,7 @@ class ClockCalibrator:
         receptions: list[dict],
         now: float,
     ) -> list[dict]:
-        """Apply clock corrections using MST-based normalization.
-
-        Builds a graph of sensor pairs weighted by clock offset variance,
-        finds the minimum spanning tree (Prim's algorithm), picks the
-        best-connected node as reference, and normalizes all timestamps
-        through the optimal-variance path. This is equivalent to
-        mutability/mlat-server's clocknorm.normalize() pipeline.
-
-        Args:
-            receptions: List of reception dicts (will be modified in place).
-            now: Monotonic time for predicting current offsets.
-
-        Returns:
-            The corrected receptions list (same objects, modified in place).
-        """
+        """Normalize reception timestamps with MST-based clock corrections."""
         if len(receptions) < 2:
             return receptions
 
@@ -330,8 +237,7 @@ class ClockCalibrator:
         n = len(sensors)
         sensor_idx = {s: i for i, s in enumerate(sensors)}
 
-        # Build adjacency: edges weighted by clock offset variance
-        # Lower variance = better calibration = preferred path
+        # Build adjacency edges weighted by clock-offset variance.
         edges: list[tuple[float, int, int, float]] = []  # (variance, i, j, offset)
         for i in range(n):
             for j in range(i + 1, n):
@@ -342,23 +248,20 @@ class ClockCalibrator:
                     continue
                 offset = pairing.predict(now)
                 variance = pairing.variance if pairing.variance > 0 else 1e-20
-                # offset = clock_{key[0]} - clock_{key[1]}
-                # To bring j to i's timebase: add (clock_i - clock_j) to j
+                # Convert the stored pair offset into a correction from `j` to `i`.
                 if s_a == key[0]:
-                    # sensors[i] == key[0], sensors[j] == key[1]
-                    # offset = clock_i - clock_j → add offset to j
+                    # Add the direct offset when `i` is the lower-ID sensor.
                     correction_i_to_j = offset
                 else:
-                    # sensors[i] == key[1], sensors[j] == key[0]
-                    # offset = clock_j - clock_i → add -offset to j
+                    # Negate the offset when `i` is the higher-ID sensor.
                     correction_i_to_j = -offset
                 edges.append((variance, i, j, correction_i_to_j))
 
         if not edges:
-            # No valid pairings — fall back to no correction
+            # Fall back to raw timestamps when no valid pairings exist.
             return receptions
 
-        # Prim's MST: start from the node with the most valid edges (best-connected)
+        # Start Prim's algorithm from the best-connected sensor.
         edge_count = [0] * n
         adj: dict[int, list[tuple[float, int, float]]] = {i: [] for i in range(n)}
         for var, i, j, corr in edges:
@@ -367,13 +270,12 @@ class ClockCalibrator:
             edge_count[i] += 1
             edge_count[j] += 1
 
-        # Pick reference node: most edges (best connected)
+        # Pick the reference node with the most valid edges.
         ref_node = max(range(n), key=lambda x: edge_count[x])
 
-        # Prim's algorithm to build MST
+        # Build the minimum spanning tree with Prim's algorithm.
         visited = set()
-        # correction[i] = cumulative correction to apply to sensor i
-        # to bring it into ref_node's timebase
+        # Store the cumulative correction that brings each sensor into the reference timebase.
         correction = [0.0] * n
         heap: list[tuple[float, int, int, float]] = []
         visited.add(ref_node)
@@ -386,13 +288,13 @@ class ClockCalibrator:
             if dst in visited:
                 continue
             visited.add(dst)
-            # Cumulative correction: ref → ... → src → dst
+            # Accumulate the correction along the MST path.
             correction[dst] = correction[src] + corr
             for next_var, next_node, next_corr in adj[dst]:
                 if next_node not in visited:
                     heapq.heappush(heap, (next_var, dst, next_node, next_corr))
 
-        # Apply corrections (ref_node gets 0 correction)
+        # Apply corrections while leaving the reference node unchanged.
         for i in range(n):
             if i == ref_node or i not in visited:
                 continue
@@ -403,7 +305,7 @@ class ClockCalibrator:
             correction_ns = int(round(corr * 1e9))
             receptions[i]["timestamp_ns"] += correction_ns
 
-            # Handle overflow/underflow of nanoseconds
+            # Renormalize nanoseconds after the correction.
             while receptions[i]["timestamp_ns"] >= 1_000_000_000:
                 receptions[i]["timestamp_ns"] -= 1_000_000_000
                 receptions[i]["timestamp_s"] += 1
@@ -415,14 +317,7 @@ class ClockCalibrator:
         return receptions
 
     def is_calibrated(self, receptions: list[dict]) -> bool:
-        """Check if we have valid clock pairings for all receiver pairs in a group.
-
-        Args:
-            receptions: List of reception dicts.
-
-        Returns:
-            True if all pairwise offsets are calibrated.
-        """
+        """Return whether every receiver pair in the group has a valid calibration."""
         sensors = [r["sensor_id"] for r in receptions]
         ref = sensors[0]
         for s in sensors[1:]:

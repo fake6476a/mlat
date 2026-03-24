@@ -1,36 +1,17 @@
 #!/usr/bin/env python3
-"""Layer 2: Mode-S Decoder
-
-Reads Layer 1 JSONL from stdin, decodes each Mode-S message using pyModeS,
-and outputs enriched JSONL to stdout.
-
-Usage:
-    ./data-pipe/mlat-pipe | python3 modes-decoder/main.py
-
-Input (JSONL from Layer 1):
-    {"sensor_id":1234,"lat":50.1,"lon":-5.7,"alt":100.0,
-     "timestamp_s":43200,"timestamp_ns":500000000,"raw_msg":"2000171806a983"}
-
-Output (JSONL):
-    {"icao":"4CA7E8","df_type":4,"altitude_ft":36000,"squawk":null,
-     "raw_msg":"2000171806A983",
-     "sensor_id":1234,"lat":50.1,"lon":-5.7,"alt":100.0,
-     "timestamp_s":43200,"timestamp_ns":500000000}
-
-All logs go to stderr to keep stdout as a clean data stream.
-"""
+"""Read Layer 1 JSONL, decode Mode-S frames, and emit enriched JSONL."""
 
 import json
 import os
 import sys
 import time
 
-# Ensure imports work regardless of CWD
+# Make sibling imports work regardless of the current working directory.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from decoder import decode_message
 
-# Stats counters
+# Track decoder statistics.
 stats = {
     "received": 0,
     "decoded": 0,
@@ -38,7 +19,7 @@ stats = {
     "failed_decode": 0,
 }
 
-# Per-DF-type counters
+# Track counts per DF type.
 df_counts: dict[int, int] = {}
 
 STATS_INTERVAL = 30  # seconds
@@ -65,7 +46,7 @@ def process_line(line: str) -> None:
     """Process a single JSONL line from Layer 1."""
     stats["received"] += 1
 
-    # Parse input JSON
+    # Parse the input JSON.
     try:
         packet = json.loads(line)
     except (json.JSONDecodeError, TypeError):
@@ -77,7 +58,7 @@ def process_line(line: str) -> None:
         stats["failed_decode"] += 1
         return
 
-    # Decode the Mode-S message
+    # Decode the Mode-S message.
     decoded = decode_message(raw_msg)
     if decoded is None:
         stats["failed_decode"] += 1
@@ -85,11 +66,11 @@ def process_line(line: str) -> None:
 
     stats["decoded"] += 1
 
-    # Track DF type distribution
+    # Update the DF type histogram.
     df = decoded["df_type"]
     df_counts[df] = df_counts.get(df, 0) + 1
 
-    # Build output: decoded fields + sensor metadata from Layer 1
+    # Combine decoded fields with the original sensor metadata.
     output = {
         "icao": decoded["icao"],
         "df_type": decoded["df_type"],
@@ -104,7 +85,7 @@ def process_line(line: str) -> None:
         "timestamp_ns": packet.get("timestamp_ns"),
     }
 
-    # Write to stdout as JSONL
+    # Emit the decoded packet as JSONL.
     print(json.dumps(output, separators=(",", ":")), flush=True)
 
 
@@ -123,7 +104,7 @@ def main() -> None:
 
             process_line(line)
 
-            # Periodic stats
+            # Print periodic stats.
             now = time.monotonic()
             if now - last_stats_time >= STATS_INTERVAL:
                 print_stats()

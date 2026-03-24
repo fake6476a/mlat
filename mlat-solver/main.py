@@ -1,47 +1,6 @@
 #!/usr/bin/env python3
-"""Layer 4: MLAT Solver (Enhanced)
+"""Read Layer 3 groups, solve MLAT positions, and emit Layer 4 JSONL fixes."""
 
-Reads Layer 3 JSONL correlation groups from stdin, solves each group
-to compute aircraft position using TDOA/TOA multilateration, and
-outputs position fixes as JSONL to stdout.
-
-Enhanced pipeline (implements LAYER4_IMPROVEMENT_PLAN.md):
-
-0. Clock Calibration (Phase 1):
-   - DF17 messages with ADS-B positions used as reference beacons
-   - Pairwise receiver clock offsets tracked via PI controller
-   - All timestamps corrected before solving
-
-1. Route by sensor count:
-   - 5+ sensors → Inamdar exact algebraic (no iteration)
-   - 4 sensors (with or without altitude) → Frisch TOA (Phase 2)
-   - 3 sensors + altitude → Constrained TDOA
-   - 2 sensors + altitude + cached position → Prediction-aided (Phase 4)
-   - 0-1 sensors → Cannot solve
-
-2. Iterative refinement:
-   - Frisch TOA formulation with scipy.optimize.least_squares
-   - loss='soft_l1' for outlier robustness
-   - Atmospheric refraction velocity (Markochev model)
-   - Position cache provides better initial guesses (Phase 3)
-
-3. Validation:
-   - Position within MAX_RANGE of all sensors
-   - GDOP computation → reject if > threshold
-   - Residual check
-
-Usage:
-    Full pipeline (Layer 1 → 2 → 3 → 4):
-    ./data-pipe/mlat-pipe | python3 modes-decoder/main.py | \\
-        python3 correlation-engine/main.py | python3 mlat-solver/main.py
-
-    Or replay from saved Layer 3 output:
-    cat correlated_data.jsonl | python3 mlat-solver/main.py
-
-All logs go to stderr to keep stdout as a clean data stream.
-"""
-
-import copy
 import json
 import os
 import sys
@@ -58,7 +17,7 @@ from adsb_decoder import (
     position_to_ecef,
 )
 from clock_sync import ClockCalibrator
-from geo import ft_to_m, lla_to_ecef
+from geo import ft_to_m, lla_to_ecef, sensor_lla_to_ecef
 from position_cache import PositionCache
 from solver import solve_group
 
@@ -134,13 +93,7 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
-# =============================================================
-# Location Override System
-# =============================================================
-# The Neuron sellers report slightly-off positions (privacy).
-# The challenge provides location-overrides.txt with corrected
-# lat/lon/alt for each sensor. We match sensor_id → override
-# by geographic proximity and replace positions before solving.
+# Match seller-reported sensors to corrected location overrides before solving.
 
 _OVERRIDE_MATCH_THRESHOLD_DEG = 0.5  # ~55km — generous to catch offset sensors
 
@@ -206,10 +159,7 @@ class SensorOverrideMap:
 
 
 def _apply_overrides(receptions: list[dict], override_map: SensorOverrideMap) -> list[dict]:
-    """Apply location overrides to receptions and filter non-Cornwall sensors.
-
-    Returns only receptions from known Cornwall sensors with corrected positions.
-    """
+    """Apply location overrides and keep only corrected Cornwall receptions."""
     corrected = []
     for rec in receptions:
         sid = rec.get("sensor_id")
@@ -226,18 +176,7 @@ def _apply_overrides(receptions: list[dict], override_map: SensorOverrideMap) ->
 
 
 def _extract_df17_altitude(raw_msg: str) -> int | None:
-    """Extract altitude from a DF17 TC 9-18 airborne position message.
-
-    The ME field carries a 12-bit altitude code that the original decoder
-    misses (it only extracts altitude from DF0/4/16/20 via pms.altcode).
-    This function extracts it directly from the raw hex bytes.
-
-    Args:
-        raw_msg: 28-char hex DF17 message.
-
-    Returns:
-        Altitude in feet, or None.
-    """
+    """Extract DF17 airborne-position altitude directly from the raw ME field."""
     frame = extract_df17_position_fields(raw_msg)
     if frame is not None:
         return frame.alt_ft
@@ -278,9 +217,7 @@ def _process_group(
             + receptions[0]["timestamp_ns"] * 1e-9
         )
 
-    # =============================================================
-    # Phase 5: ADS-B CPR Decode — free cache seeding
-    # =============================================================
+    # Phase 5: Decode ADS-B CPR positions for free cache seeding.
     if group.get("df_type") == 17 and len(raw_msg) == 28:
         cpr_frame = extract_df17_position_fields(raw_msg)
         if cpr_frame is not None and msg_timestamp is not None:
@@ -315,7 +252,7 @@ def _process_group(
                     receptions=receptions, now=now,
                 )
 
-    # Phase 5b: ADS-B Velocity Decode (TC 19)
+    # Phase 5b: Decode ADS-B TC19 velocity data.
     if group.get("df_type") == 17 and len(raw_msg) == 28 and msg_timestamp is not None:
         vel = extract_df17_velocity(raw_msg)
         if vel is not None:
@@ -328,9 +265,7 @@ def _process_group(
                 timestamp=msg_timestamp,
             )
 
-    # =============================================================
-    # Phase 6: Altitude augmentation
-    # =============================================================
+    # Phase 6: Augment missing altitude from DF17 or the position cache.
     effective_alt_ft = group.get("altitude_ft")
 
     if effective_alt_ft is None and group.get("df_type") == 17:
@@ -350,26 +285,21 @@ def _process_group(
         working_group = dict(group)
         working_group["altitude_ft"] = effective_alt_ft
 
-    # =============================================================
-    # Phase 1: Clock Calibration — apply corrections
-    # =============================================================
-    corrected_receptions = copy.deepcopy(receptions)
-    if clock_cal.has_any_calibration(corrected_receptions):
+    # Phase 1: Apply clock-calibration corrections when available.
+    if clock_cal.has_any_calibration(receptions):
+        corrected_receptions = [dict(rec) for rec in receptions]
         clock_cal.correct_timestamps(corrected_receptions, now)
         corrected_group = dict(working_group)
         corrected_group["receptions"] = corrected_receptions
     else:
+        corrected_receptions = receptions
         corrected_group = working_group
 
-    # =============================================================
-    # Phase 3: Position cache lookup
-    # =============================================================
+    # Phase 3: Look up the latest cached position prior.
     cached = pos_cache.get(icao, msg_timestamp)
     position_prior = cached.predict(msg_timestamp) if (cached and msg_timestamp) else None
 
-    # =============================================================
-    # Phase 4: 2-sensor gate — require altitude + cached prior
-    # =============================================================
+    # Phase 4: Require altitude and a cached prior for 2-sensor solves.
     MAX_PAIR_VARIANCE_US2 = 50.0
     if n_sensors == 2 and effective_alt_ft is not None:
         if position_prior is None:
@@ -394,9 +324,7 @@ def _process_group(
                         stats.failure_reasons["pair_variance_exceeded"] = stats.failure_reasons.get("pair_variance_exceeded", 0) + 1
                         return
 
-    # =============================================================
-    # Solve the correlation group
-    # =============================================================
+    # Solve the corrected correlation group.
     result, fail_reason = solve_group(corrected_group, position_prior_ecef=position_prior)
 
     if result is not None:
@@ -424,13 +352,7 @@ def _process_group(
                 residual_m=result.quality_residual_m,
             )
 
-        # Q9: Only feed solver positions back to clock cal if low residual.
-        # Prevents high-residual solves from contaminating calibration.
-        # CPR-decoded positions (line 210) remain the primary trusted source.
-        # Sweep showed <200m is optimal: recovers sync points while filtering junk.
-        # R10: Additionally require that at least one clock pair in this group
-        # is already converged. This prevents early noisy solves from corrupting
-        # freshly initializing pairs — only calibrated pairs get refinement.
+        # Feed solver output back into clock calibration only for already-calibrated low-residual groups.
         if result.quality_residual_m < 200.0 and clock_cal.has_any_calibration(receptions):
             clock_cal.process_adsb_reference(
                 aircraft_ecef=aircraft_ecef,
@@ -440,7 +362,7 @@ def _process_group(
         for rec in corrected_receptions:
             s_id = rec.get("sensor_id")
             if s_id is not None:
-                s_pos = lla_to_ecef(rec["lat"], rec["lon"], rec["alt"])
+                s_pos = sensor_lla_to_ecef(rec["lat"], rec["lon"], rec["alt"])
                 dt_s = rec["timestamp_s"] - result.timestamp_s
                 dt_ns = rec["timestamp_ns"] - result.timestamp_ns
                 arr_time = dt_s + dt_ns * 1e-9
@@ -454,7 +376,7 @@ def _process_group(
         if fail_reason:
             stats.failure_reasons[fail_reason] = stats.failure_reasons.get(fail_reason, 0) + 1
 
-        # For 2-sensor failures with altitude, still pass downstream
+        # Keep passing unsolved 2-sensor altitude groups downstream for prediction aid.
         if n_sensors == 2 and effective_alt_ft is not None:
             output = {"unsolved_group": group}
             print(json.dumps(output, separators=(",", ":")), flush=True)
@@ -464,7 +386,7 @@ def main() -> None:
     log("=== MLAT Solver (Layer 4) — Enhanced with ADS-B CPR Seeding ===")
     log("Solver: Frisch TOA formulation with Inamdar algebraic initialization")
 
-    # Load location overrides for Cornwall sensors
+    # Load location overrides for Cornwall sensors.
     overrides = _load_location_overrides()
     override_map = SensorOverrideMap(overrides) if overrides else None
 
@@ -488,8 +410,7 @@ def main() -> None:
 
             stats.groups_received += 1
 
-            # Use message timestamp for clock sync (Q1 fix: time.monotonic()
-            # gives ~ms dt in batch replay; message timestamps give real seconds)
+            # Use message timestamps for clock sync so replay timing stays physically meaningful.
             _receptions = group.get("receptions", [])
             if _receptions:
                 _msg_ts = (

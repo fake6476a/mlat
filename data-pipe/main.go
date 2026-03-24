@@ -51,9 +51,7 @@ func main() {
 	log.Println("Starting Neuron SDK buyer node...")
 	log.Println("Mode-S packets will be emitted as JSON on stdout")
 
-	// Inject flags that are only checked in LaunchSDK() (not in init()).
-	// Flags checked in init() (--port, --buyer-or-seller, --envFile) must
-	// be passed on the command line — see run-pipeline.sh.
+	// Inject only the flags that LaunchSDK() still reads after init; early SDK flags must stay on the CLI.
 	injectCLIFlags()
 
 	go logStats()
@@ -104,9 +102,7 @@ func buyerCase(ctx context.Context, p2pHost host.Host, buffers *commonlib.NodeBu
 	log.Println("Buyer case context cancelled, shutting down")
 }
 
-// readSellerStream reads Mode-S packets from a seller P2P stream.
-// Wire format: [1 byte length] [N bytes payload]
-// Payload: sensor_id(8) + lat(8) + lon(8) + alt(8) + ts_s(8) + ts_ns(8) + raw_modes(remaining)
+// readSellerStream reads length-prefixed seller packets carrying sensor metadata and raw Mode-S payload bytes.
 func readSellerStream(ctx context.Context, stream network.Stream) {
 	defer stream.Close()
 	remotePeer := stream.Conn().RemotePeer()
@@ -172,9 +168,7 @@ func readSellerStream(ctx context.Context, stream network.Stream) {
 	}
 }
 
-// parsePacket parses a raw binary packet into a ModeSPacket.
-// Bytes 0-7: sensor_id (int64), 8-15: lat (float64), 16-23: lon (float64),
-// 24-31: alt (float64), 32-39: ts_s (uint64), 40-47: ts_ns (uint64), 48+: raw Mode-S
+// parsePacket decodes the binary packet layout into a ModeSPacket.
 func parsePacket(data []byte) (*ModeSPacket, error) {
 	if len(data) < 55 {
 		return nil, fmt.Errorf("packet too short: %d bytes (need at least 55)", len(data))
@@ -221,23 +215,7 @@ func logStats() {
 	}
 }
 
-// injectCLIFlags reads the .buyer-env file and injects required CLI flags
-// into os.Args BEFORE the SDK's init() parses them.
-//
-// The Neuron SDK has an init() function (neuron-sdk.go:56) that calls
-// pflag.Parse() and checks PortFlag before our main() runs. The env file
-// only sets OS env vars via godotenv — pflag doesn't read those. So flags
-// like --port, --buyer-or-seller, --mode MUST be in os.Args before init().
-//
-// This function is called from our own init() in _preinit.go, which runs
-// before the SDK's init() because Go processes same-package init() in
-// filename order, but imported packages always run first. So we use a
-// workaround: inject into os.Args in init() of the main package.
-//
-// IMPORTANT: This won't work because imported package init() runs BEFORE
-// main package init(). The actual solution is to pass flags on the command
-// line. This function exists as a fallback for any flags checked in
-// LaunchSDK() (after init), like --list-of-sellers-source.
+// injectCLIFlags only adds fallback flags that LaunchSDK() reads after SDK init, because early SDK flags must be passed on the command line.
 func injectCLIFlags() {
 	hasFlag := func(name string) bool {
 		for _, arg := range os.Args[1:] {
@@ -248,8 +226,7 @@ func injectCLIFlags() {
 		return false
 	}
 
-	// --list-of-sellers-source is checked in LaunchSDK(), not init(),
-	// so injecting it here (in main()) still works.
+	// Inject `--list-of-sellers-source` here because LaunchSDK() still reads it after init.
 	if !hasFlag("list-of-sellers-source") {
 		os.Args = append(os.Args, "--list-of-sellers-source", "env")
 	}

@@ -1,34 +1,20 @@
-"""Mode-S message decoder using pyModeS.
-
-Decodes raw Mode-S hex messages into structured fields:
-  - ICAO 24-bit aircraft address
-  - Downlink Format (DF) type
-  - Barometric altitude (from DF0, DF4, DF16, DF20)
-  - Squawk/identity code (from DF5, DF21)
-
-References:
-  - The 1090MHz Riddle (mode-s.org/decode) by Junzi Sun
-  - pyModeS API docs (mode-s.org/pymodes/api/)
-  - ICAO Doc 9871 (Mode S Technical Provisions)
-"""
+"""Decode raw Mode-S hex messages into structured fields with pyModeS."""
 
 import pyModeS as pms
 
-# Valid hex message lengths:
-#   14 hex chars = 56 bits (short: DF0, DF4, DF5, DF11)
-#   28 hex chars = 112 bits (long: DF16, DF17, DF18, DF19, DF20, DF21)
+# Accept short 56-bit and long 112-bit Mode-S hex messages.
 VALID_MSG_LENGTHS = (14, 28)
 
-# DF types that carry altitude in the AC (Altitude Code) field
+# Track DF types that carry altitude in the AC field.
 DF_WITH_ALTITUDE = {0, 4, 16, 20}
 
-# DF types that carry identity/squawk in the ID field
+# Track DF types that carry identity or squawk in the ID field.
 DF_WITH_SQUAWK = {5, 21}
 
-# DF types where ICAO must be recovered via AP XOR CRC
+# Track DF types whose ICAO is recovered through AP XOR CRC.
 DF_ICAO_PARITY = {0, 4, 5, 16, 20, 21}
 
-# All DF types we can meaningfully decode
+# List the DF types this decoder handles.
 KNOWN_DF_TYPES = {0, 4, 5, 11, 16, 17, 18, 20, 21}
 
 
@@ -42,20 +28,7 @@ def is_valid_hex(msg: str) -> bool:
 
 
 def decode_message(raw_msg: str) -> dict | None:
-    """Decode a raw Mode-S hex message string.
-
-    Args:
-        raw_msg: Hex-encoded Mode-S message (14 or 28 hex characters).
-
-    Returns:
-        Dictionary with decoded fields, or None if the message is invalid.
-        Fields:
-            icao: str - 6-char hex ICAO aircraft address (uppercase)
-            df_type: int - Downlink Format number
-            altitude_ft: int | None - Barometric altitude in feet (DF0/4/16/20)
-            squawk: str | None - 4-digit squawk code (DF5/21)
-            raw_msg: str - Original hex message (uppercase)
-    """
+    """Decode one raw Mode-S hex message and return the extracted fields."""
     if not raw_msg or not isinstance(raw_msg, str):
         return None
 
@@ -67,7 +40,7 @@ def decode_message(raw_msg: str) -> dict | None:
     if not is_valid_hex(msg):
         return None
 
-    # Extract downlink format
+    # Decode the downlink format.
     try:
         df = pms.df(msg)
     except Exception:
@@ -76,9 +49,7 @@ def decode_message(raw_msg: str) -> dict | None:
     if df not in KNOWN_DF_TYPES:
         return None
 
-    # Extract ICAO address
-    # pyModeS.icao() handles both clear-text (DF11/17/18) and
-    # parity-recovery (DF0/4/5/16/20/21) automatically
+    # Decode the ICAO address, including parity-recovered formats.
     try:
         icao = pms.icao(msg)
     except Exception:
@@ -87,15 +58,12 @@ def decode_message(raw_msg: str) -> dict | None:
     if not icao or len(icao) != 6:
         return None
 
-    # For parity-recovered ICAO (DF0/4/5/16/20/21), validate with CRC
-    # The CRC remainder after XOR should yield a plausible ICAO
+    # Reject the all-zero parity-recovered ICAO placeholder.
     if df in DF_ICAO_PARITY:
-        # For parity-recovered ICAO, verify it's non-zero
-        # pyModeS.icao() already does AP XOR CRC(payload) extraction
         if icao == "000000":
             return None
 
-    # Build result
+    # Build the decoded result payload.
     result = {
         "icao": icao.upper(),
         "df_type": df,
@@ -104,7 +72,7 @@ def decode_message(raw_msg: str) -> dict | None:
         "raw_msg": msg,
     }
 
-    # Decode altitude for DF types that carry it
+    # Decode altitude for DF types that expose it directly.
     if df in DF_WITH_ALTITUDE:
         try:
             alt = pms.altcode(msg)
@@ -113,9 +81,7 @@ def decode_message(raw_msg: str) -> dict | None:
         except Exception:
             pass
 
-    # Decode altitude from DF17 TC 9-18 airborne position messages.
-    # These carry altitude in the ME field (12-bit Q-bit encoded),
-    # which pms.altcode() does not extract for DF17.
+    # Decode DF17 airborne-position altitude from the ADS-B ME field when needed.
     if df == 17 and len(msg) == 28 and result["altitude_ft"] is None:
         try:
             tc = pms.adsb.typecode(msg)
@@ -126,7 +92,7 @@ def decode_message(raw_msg: str) -> dict | None:
         except Exception:
             pass
 
-    # Decode squawk/identity for DF types that carry it
+    # Decode the squawk or identity field when present.
     if df in DF_WITH_SQUAWK:
         try:
             squawk = pms.idcode(msg)

@@ -1,14 +1,11 @@
 #!/bin/bash
-# Run the full MLAT data pipeline: data-pipe → decoder → correlator → output
-#
-# The Neuron SDK's init() checks --port and --buyer-or-seller BEFORE main()
-# runs, so these MUST be CLI args (env file values are loaded too late).
+# Run the Layer 1→3 MLAT pipeline and capture correlation groups.
 
 set -euo pipefail
 
 cd "$(dirname "$0")/data-pipe"
 
-# Read port from buyer-env
+# Read the port from the buyer env file because the SDK needs it on the CLI.
 PORT=$(grep '^port=' .buyer-env | cut -d= -f2)
 if [ -z "$PORT" ]; then
     echo "ERROR: port not found in .buyer-env" >&2

@@ -1,42 +1,12 @@
 #!/usr/bin/env python3
-"""Layer 3: Correlation Engine
-
-Reads Layer 2 JSONL from stdin, groups receptions of the same Mode-S
-transmission by multiple sensors using time-windowed correlation, and
-outputs correlation groups as JSONL to stdout.
-
-Usage:
-    python3 modes-decoder/main.py < data.jsonl | python3 correlation-engine/main.py
-
-    Or full pipeline:
-    ./data-pipe/mlat-pipe | python3 modes-decoder/main.py | python3 correlation-engine/main.py
-
-Input (JSONL from Layer 2):
-    {"icao":"4CA7E8","df_type":4,"altitude_ft":36000,"squawk":null,
-     "raw_msg":"2000171806A983","sensor_id":1001,"lat":50.1,"lon":-5.7,
-     "alt":100.0,"timestamp_s":43200,"timestamp_ns":500000000}
-
-Output (JSONL):
-    {"icao":"4CA7E8","df_type":4,"altitude_ft":36000,"squawk":null,
-     "raw_msg":"2000171806A983","num_sensors":3,
-     "receptions":[
-       {"sensor_id":1001,"lat":50.1,"lon":-5.7,"alt":100.0,
-        "timestamp_s":43200,"timestamp_ns":500000000},
-       {"sensor_id":1002,"lat":50.2,"lon":-5.6,"alt":105.0,
-        "timestamp_s":43200,"timestamp_ns":500000050},
-       {"sensor_id":1003,"lat":50.3,"lon":-5.5,"alt":110.0,
-        "timestamp_s":43200,"timestamp_ns":500000100}
-     ]}
-
-All logs go to stderr to keep stdout as a clean data stream.
-"""
+"""Read Layer 2 JSONL, group correlated receptions, and emit Layer 3 JSONL."""
 
 import json
 import os
 import sys
 import time
 
-# Ensure imports work regardless of CWD
+# Make sibling imports work regardless of the current working directory.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from correlator import Correlator
@@ -50,7 +20,7 @@ def log(msg: str) -> None:
 
 
 def main() -> None:
-    # Configuration via environment variables
+    # Read runtime configuration from environment variables.
     window_ms = float(os.environ.get("MLAT_WINDOW_MS", "2.0"))
     min_receptions = int(os.environ.get("MLAT_MIN_RECEPTIONS", "2"))
 
@@ -72,21 +42,21 @@ def main() -> None:
             if not line:
                 continue
 
-            # Parse input JSON
+            # Parse the incoming JSON packet.
             try:
                 packet = json.loads(line)
             except (json.JSONDecodeError, TypeError):
                 parse_errors += 1
                 continue
 
-            # Process through correlator
+            # Process the packet through the correlator.
             emitted = correlator.process(packet)
 
-            # Output completed groups
+            # Emit completed groups as JSONL.
             for group in emitted:
                 print(json.dumps(group, separators=(",", ":")), flush=True)
 
-            # Periodic stats
+            # Print periodic stats.
             now = time.monotonic()
             if now - last_stats_time >= STATS_INTERVAL:
                 stats = correlator.stats()
@@ -98,7 +68,7 @@ def main() -> None:
     except BrokenPipeError:
         pass
     finally:
-        # Flush remaining groups at end of stream
+        # Flush any remaining groups at end of stream.
         remaining = correlator.flush_all()
         for group in remaining:
             print(json.dumps(group, separators=(",", ":")), flush=True)

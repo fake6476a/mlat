@@ -1,34 +1,159 @@
-"""Frisch TOA formulation for iterative MLAT refinement.
-
-Implements the TOA approach from:
-  Frisch & Hanebeck (2025), "Why You Shouldn't Use TDOA for Multilateration",
-  MFI 2025. Code reference: github.com/KIT-ISAS/MFI2025_MLAT-TOA
-
-Key insight: Instead of forming pairwise TDOA equations (which loses
-information and introduces correlated noise), keep all N TOA equations
-and eliminate the unknown transmission time analytically:
-
-    t0_hat(x) = weighted_mean(t_i - ||x - s_i|| / c)
-
-This reduces the problem from 4D (x, y, z, t0) to 3D (x, y, z),
-making it simpler and faster than TDOA.
-
-Comparison with mutability/mlat-server (Part 13.1):
-  - mutability: [x, y, z, offset] (4D), scipy finds t0 numerically
-  - Frisch: [x, y, z] (3D), t0 eliminated analytically
-
-References:
-  - MLAT_Verified_Combined_Reference.md Part 18 (Frisch formulation)
-  - MLAT_Verified_Combined_Reference.md Part 22 (Key formulas)
-  - isas.iar.kit.edu/pdf/MFI25_Frisch.pdf
-"""
+"""Implement the Frisch TOA formulation for iterative MLAT refinement."""
 
 from __future__ import annotations
 
 import numpy as np
+from numba import njit
 from scipy.optimize import least_squares
 
 from atmosphere import C_VACUUM, effective_velocity
+from geo import ecef_to_lla, lla_to_ecef
+
+
+@njit(cache=True)
+def _timing_state_core(
+    x: np.ndarray,
+    sensors: np.ndarray,
+    arrival_times: np.ndarray,
+    velocities: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    n = sensors.shape[0]
+    residuals = np.empty(n, dtype=np.float64)
+    ranges = np.empty(n, dtype=np.float64)
+    units = np.empty((n, 3), dtype=np.float64)
+    t0_sum = 0.0
+
+    for i in range(n):
+        dx0 = x[0] - sensors[i, 0]
+        dx1 = x[1] - sensors[i, 1]
+        dx2 = x[2] - sensors[i, 2]
+        r = np.sqrt(dx0 * dx0 + dx1 * dx1 + dx2 * dx2)
+        if r < 1e-12:
+            units[i, 0] = 0.0
+            units[i, 1] = 0.0
+            units[i, 2] = 0.0
+            r = 1e-12
+        else:
+            inv_r = 1.0 / r
+            units[i, 0] = dx0 * inv_r
+            units[i, 1] = dx1 * inv_r
+            units[i, 2] = dx2 * inv_r
+        ranges[i] = r
+        t0_sum += arrival_times[i] - r / velocities[i]
+
+    t0_hat = t0_sum / n
+
+    for i in range(n):
+        residuals[i] = (arrival_times[i] - t0_hat) * velocities[i] - ranges[i]
+
+    return residuals, ranges, units, t0_hat
+
+
+@njit(cache=True)
+def _timing_jacobian_core(
+    units: np.ndarray,
+    velocities: np.ndarray,
+) -> np.ndarray:
+    n = units.shape[0]
+    sum_u_over_v = np.zeros(3, dtype=np.float64)
+
+    for i in range(n):
+        inv_v = 1.0 / velocities[i]
+        sum_u_over_v[0] += units[i, 0] * inv_v
+        sum_u_over_v[1] += units[i, 1] * inv_v
+        sum_u_over_v[2] += units[i, 2] * inv_v
+
+    jac = np.empty((n, 3), dtype=np.float64)
+    inv_n = 1.0 / n
+
+    for i in range(n):
+        scale = velocities[i] * inv_n
+        jac[i, 0] = scale * sum_u_over_v[0] - units[i, 0]
+        jac[i, 1] = scale * sum_u_over_v[1] - units[i, 1]
+        jac[i, 2] = scale * sum_u_over_v[2] - units[i, 2]
+
+    return jac
+
+
+def _compute_velocities(
+    sensor_alts_m: np.ndarray,
+    aircraft_alt_m: float | None,
+    c: float = C_VACUUM,
+) -> np.ndarray:
+    if aircraft_alt_m is None:
+        return np.full(len(sensor_alts_m), c, dtype=np.float64)
+
+    velocities = np.empty(len(sensor_alts_m), dtype=np.float64)
+    for i, h_s in enumerate(sensor_alts_m):
+        velocities[i] = effective_velocity(float(h_s), aircraft_alt_m)
+    return velocities
+
+
+def _timing_residuals_from_velocities(
+    x: np.ndarray,
+    sensors: np.ndarray,
+    arrival_times: np.ndarray,
+    velocities: np.ndarray,
+) -> np.ndarray:
+    residuals, _, _, _ = _timing_state_core(x, sensors, arrival_times, velocities)
+    return residuals
+
+
+def _altitude_residual(
+    x: np.ndarray,
+    aircraft_alt_m: float,
+) -> float:
+    _, _, current_alt = ecef_to_lla(x[0], x[1], x[2])
+    return (current_alt - aircraft_alt_m) * 10.0
+
+
+def _altitude_residual_and_gradient(
+    x: np.ndarray,
+    aircraft_alt_m: float,
+) -> tuple[float, np.ndarray]:
+    alt_residual = _altitude_residual(x, aircraft_alt_m)
+    grad = np.empty(3, dtype=np.float64)
+    step_scale = np.sqrt(np.finfo(np.float64).eps)
+
+    for axis in range(3):
+        step = step_scale * max(1.0, abs(float(x[axis])))
+        x_step = x.copy()
+        x_step[axis] += step
+        grad[axis] = (_altitude_residual(x_step, aircraft_alt_m) - alt_residual) / step
+
+    return alt_residual, grad
+
+
+def _build_objective_residuals(
+    timing_residuals: np.ndarray,
+    x: np.ndarray,
+    aircraft_alt_m: float | None,
+    track_prediction_ecef: np.ndarray | None,
+    prediction_weight: float,
+    altitude_residual: float | None = None,
+) -> np.ndarray:
+    extra = 0
+    if aircraft_alt_m is not None:
+        extra += 1
+    if track_prediction_ecef is not None:
+        extra += 3
+    if extra == 0:
+        return timing_residuals
+
+    residuals = np.empty(len(timing_residuals) + extra, dtype=np.float64)
+    residuals[:len(timing_residuals)] = timing_residuals
+    idx = len(timing_residuals)
+
+    if aircraft_alt_m is not None:
+        if altitude_residual is None:
+            altitude_residual = _altitude_residual(x, aircraft_alt_m)
+        residuals[idx] = altitude_residual
+        idx += 1
+
+    if track_prediction_ecef is not None:
+        residuals[idx:idx + 3] = (x - track_prediction_ecef) * prediction_weight
+
+    return residuals
 
 
 def _timing_residuals(
@@ -39,18 +164,8 @@ def _timing_residuals(
     aircraft_alt_m: float | None,
     c: float = C_VACUUM,
 ) -> np.ndarray:
-    N = len(sensors)
-    ranges = np.array([np.linalg.norm(x - s) for s in sensors])
-
-    if aircraft_alt_m is not None:
-        velocities = np.array([
-            effective_velocity(h_s, aircraft_alt_m) for h_s in sensor_alts_m
-        ])
-    else:
-        velocities = np.full(N, c)
-
-    t0_hat = np.mean(arrival_times - ranges / velocities)
-    return (arrival_times - t0_hat) * velocities - ranges
+    velocities = _compute_velocities(sensor_alts_m, aircraft_alt_m, c)
+    return _timing_residuals_from_velocities(x, sensors, arrival_times, velocities)
 
 
 def frisch_residual(
@@ -63,55 +178,137 @@ def frisch_residual(
     c: float = C_VACUUM,
     prediction_weight: float = 8.0,
 ) -> np.ndarray:
-    """Compute TOA residuals with analytical t0 elimination.
-
-    The Frisch formulation eliminates t0 in closed form:
-        t0_hat = mean(t_i - ||x - s_i|| / c_i)
-        residual_i = (t_i - t0_hat) * c - ||x - s_i||
-
-    Uses atmospheric refraction-corrected velocity per sensor pair
-    (Markochev model) when aircraft altitude is known.
-
-    Args:
-        x: Current position estimate [x, y, z] in ECEF meters.
-        sensors: Sensor positions, shape (N, 3) in ECEF meters.
-        arrival_times: Arrival times in seconds, shape (N,).
-        sensor_alts_m: Sensor altitudes in meters, shape (N,).
-        aircraft_alt_m: Aircraft altitude in meters, or None.
-        c: Default speed of propagation in m/s.
-
-    Returns:
-        Residuals in distance units (meters), shape (N,).
-    """
-    residuals = _timing_residuals(
+    """Compute Frisch TOA residuals with analytical elimination of transmission time."""
+    velocities = _compute_velocities(sensor_alts_m, aircraft_alt_m, c)
+    timing_residuals = _timing_residuals_from_velocities(
         x,
         sensors,
         arrival_times,
-        sensor_alts_m,
+        velocities,
+    )
+    return _build_objective_residuals(
+        timing_residuals,
+        x,
         aircraft_alt_m,
-        c,
+        track_prediction_ecef,
+        prediction_weight,
     )
 
-    # Optional: altitude constraint as a pseudo-sensor
-    if aircraft_alt_m is not None:
-        from geo import ecef_to_lla
-        _, _, current_alt = ecef_to_lla(x[0], x[1], x[2])
-        # Strong weight to force altitude adherence (critical for 2-sensor)
-        alt_residual = (current_alt - aircraft_alt_m) * 10.0
-        residuals = np.append(residuals, alt_residual)
 
-    # Optional: prediction anchor for underdetermined 2-sensor fallback
-    if track_prediction_ecef is not None:
-        # Per-axis soft constraint forcing the solver to pick the intersection
-        # closest to the EKF prediction. Weight = 5.0 provides a strong anchor
-        # for under-determined 2-sensor systems while still allowing geometry
-        # to shift the solution when TDOA data clearly supports it.
-        # Using per-axis residuals (3 values) instead of scalar distance
-        # gives the optimizer better gradient information.
-        pred_residuals = (x - track_prediction_ecef) * prediction_weight
-        residuals = np.append(residuals, pred_residuals)
+class _FrischEvaluator:
+    __slots__ = (
+        "sensors",
+        "arrival_times",
+        "aircraft_alt_m",
+        "track_prediction_ecef",
+        "prediction_weight",
+        "velocities",
+        "_last_x",
+        "_last_timing_residuals",
+        "_last_ranges",
+        "_last_units",
+        "_last_t0_hat",
+        "_last_altitude_residual",
+    )
 
-    return residuals
+    def __init__(
+        self,
+        sensors: np.ndarray,
+        arrival_times: np.ndarray,
+        sensor_alts_m: np.ndarray,
+        aircraft_alt_m: float | None,
+        track_prediction_ecef: np.ndarray | None,
+        c: float,
+        prediction_weight: float,
+    ) -> None:
+        self.sensors = sensors
+        self.arrival_times = arrival_times
+        self.aircraft_alt_m = aircraft_alt_m
+        self.track_prediction_ecef = track_prediction_ecef
+        self.prediction_weight = prediction_weight
+        self.velocities = _compute_velocities(sensor_alts_m, aircraft_alt_m, c)
+        self._last_x: np.ndarray | None = None
+        self._last_timing_residuals: np.ndarray | None = None
+        self._last_ranges: np.ndarray | None = None
+        self._last_units: np.ndarray | None = None
+        self._last_t0_hat = 0.0
+        self._last_altitude_residual: float | None = None
+
+    def _ensure_state(self, x: np.ndarray) -> None:
+        if self._last_x is not None and np.array_equal(x, self._last_x):
+            return
+
+        residuals, ranges, units, t0_hat = _timing_state_core(
+            x,
+            self.sensors,
+            self.arrival_times,
+            self.velocities,
+        )
+        self._last_x = x.copy()
+        self._last_timing_residuals = residuals
+        self._last_ranges = ranges
+        self._last_units = units
+        self._last_t0_hat = t0_hat
+        self._last_altitude_residual = None
+
+    def residual(self, x: np.ndarray) -> np.ndarray:
+        self._ensure_state(x)
+
+        altitude_residual = None
+        if self.aircraft_alt_m is not None:
+            if self._last_altitude_residual is None:
+                self._last_altitude_residual = _altitude_residual(self._last_x, self.aircraft_alt_m)
+            altitude_residual = self._last_altitude_residual
+
+        return _build_objective_residuals(
+            self._last_timing_residuals,
+            self._last_x,
+            self.aircraft_alt_m,
+            self.track_prediction_ecef,
+            self.prediction_weight,
+            altitude_residual,
+        )
+
+    def jacobian(self, x: np.ndarray) -> np.ndarray:
+        self._ensure_state(x)
+        timing_jac = _timing_jacobian_core(self._last_units, self.velocities)
+
+        extra = 0
+        if self.aircraft_alt_m is not None:
+            extra += 1
+        if self.track_prediction_ecef is not None:
+            extra += 3
+        if extra == 0:
+            return timing_jac
+
+        jac = np.empty((timing_jac.shape[0] + extra, 3), dtype=np.float64)
+        jac[:timing_jac.shape[0], :] = timing_jac
+        idx = timing_jac.shape[0]
+
+        if self.aircraft_alt_m is not None:
+            alt_residual, alt_grad = _altitude_residual_and_gradient(self._last_x, self.aircraft_alt_m)
+            self._last_altitude_residual = alt_residual
+            jac[idx, :] = alt_grad
+            idx += 1
+
+        if self.track_prediction_ecef is not None:
+            jac[idx:idx + 3, :] = 0.0
+            jac[idx, 0] = self.prediction_weight
+            jac[idx + 1, 1] = self.prediction_weight
+            jac[idx + 2, 2] = self.prediction_weight
+
+        return jac
+
+    def timing_residuals(self, x: np.ndarray) -> np.ndarray:
+        self._ensure_state(x)
+        return self._last_timing_residuals.copy()
+
+    def objective_residuals(self, x: np.ndarray) -> np.ndarray:
+        return self.residual(x)
+
+    def t0_s(self, x: np.ndarray) -> float:
+        self._ensure_state(x)
+        return float(self._last_t0_hat)
 
 
 def solve_toa(
@@ -125,31 +322,30 @@ def solve_toa(
     max_nfev: int = 1000,
     prediction_weight: float = 8.0,
 ) -> dict | None:
-    """Iterative MLAT solve using Frisch TOA formulation.
-
-    Uses scipy.optimize.least_squares with:
-      - Trust Region Reflective (trf) method
-      - Huber loss for outlier robustness (Part 21, Approach 1)
-      - f_scale=100.0 (Huber transition at 100m residual)
-
-    Args:
-        sensors: Sensor positions, shape (N, 3) in ECEF meters.
-        arrival_times: Arrival times in seconds, shape (N,).
-        sensor_alts_m: Sensor altitudes in meters, shape (N,).
-        x0: Initial position estimate in ECEF [x, y, z].
-        altitude_m: Known aircraft altitude in meters, or None.
-        c: Speed of propagation in m/s.
-        max_nfev: Maximum function evaluations.
-
-    Returns:
-        Dict with {position, residual_m, t0_s, success} or None if failed.
-    """
+    """Solve an MLAT position iteratively with the Frisch TOA formulation."""
     try:
+        sensors = np.asarray(sensors, dtype=np.float64)
+        arrival_times = np.asarray(arrival_times, dtype=np.float64)
+        sensor_alts_m = np.asarray(sensor_alts_m, dtype=np.float64)
+        x0 = np.asarray(x0, dtype=np.float64)
+        if track_prediction_ecef is not None:
+            track_prediction_ecef = np.asarray(track_prediction_ecef, dtype=np.float64)
+
+        evaluator = _FrischEvaluator(
+            sensors=sensors,
+            arrival_times=arrival_times,
+            sensor_alts_m=sensor_alts_m,
+            aircraft_alt_m=altitude_m,
+            track_prediction_ecef=track_prediction_ecef,
+            c=c,
+            prediction_weight=prediction_weight,
+        )
+
         # Full 3D solve in ECEF coordinates
         result = least_squares(
-            frisch_residual,
+            evaluator.residual,
             x0,
-            args=(sensors, arrival_times, sensor_alts_m, altitude_m, track_prediction_ecef, c, prediction_weight),
+            jac=evaluator.jacobian,
             method="trf",
             loss="soft_l1",
             f_scale=500.0,  # Moderate outlier transition — balances convergence from far init vs accuracy
@@ -161,40 +357,19 @@ def solve_toa(
 
         position = result.x.copy()
 
-        # If altitude is known, correct the solved altitude to match.
-        # This implements the "2.5D multilateration" concept from Nik
-        # (MLAT_Verified_Combined_Reference.md Part 2.3, tip #2):
-        # fix the altitude dimension and use the solved lat/lon.
+        # Reproject the solution onto the known altitude in the usual 2.5D MLAT way.
         if altitude_m is not None:
-            from geo import ecef_to_lla, lla_to_ecef
-
             lat, lon, _ = ecef_to_lla(position[0], position[1], position[2])
             position = lla_to_ecef(lat, lon, altitude_m)
 
         # Compute final residual (RMS of all residual terms including constraints)
-        final_residuals = frisch_residual(
-            position, sensors, arrival_times, sensor_alts_m, altitude_m, track_prediction_ecef, c, prediction_weight
-        )
-        timing_residuals = _timing_residuals(
-            position,
-            sensors,
-            arrival_times,
-            sensor_alts_m,
-            altitude_m,
-            c,
-        )
+        final_residuals = evaluator.objective_residuals(position)
+        timing_residuals = evaluator.timing_residuals(position)
         residual_m = float(np.sqrt(np.mean(timing_residuals ** 2)))
         objective_residual_m = float(np.sqrt(np.mean(final_residuals ** 2)))
 
         # Compute estimated transmission time
-        ranges = np.array([np.linalg.norm(position - s) for s in sensors])
-        if altitude_m is not None:
-            velocities = np.array([
-                effective_velocity(h_s, altitude_m) for h_s in sensor_alts_m
-            ])
-        else:
-            velocities = np.full(len(sensors), c)
-        t0_s = float(np.mean(arrival_times - ranges / velocities))
+        t0_s = evaluator.t0_s(position)
 
         return {
             "position": position,
@@ -218,25 +393,7 @@ def solve_constrained_3sensor(
     x0: np.ndarray,
     c: float = C_VACUUM,
 ) -> dict | None:
-    """TDOA solve for exactly 3 sensors with known altitude.
-
-    With 3 sensors + altitude constraint, the system is determined.
-    Uses the full 3D Frisch TOA formulation with altitude correction.
-
-    This is the standard approach for 3-sensor MLAT as described in
-    FR24's operational system (Part 9) and Osypiuk 2025 (Part 17).
-
-    Args:
-        sensors: Sensor positions, shape (3, 3) in ECEF meters.
-        arrival_times: Arrival times, shape (3,).
-        sensor_alts_m: Sensor altitudes in meters, shape (3,).
-        altitude_m: Known aircraft altitude in meters.
-        x0: Initial position estimate in ECEF.
-        c: Speed of propagation in m/s.
-
-    Returns:
-        Dict with {position, residual_m, t0_s, success} or None.
-    """
+    """Solve the exactly determined 3-sensor-plus-altitude MLAT case."""
     return solve_toa(
         sensors=sensors,
         arrival_times=arrival_times,
