@@ -1,44 +1,25 @@
-# Ignore built binaries.
-mlat-pipe
-*.exe
-*.out
-
-# Ignore environment files that may contain secrets.
-.env
-*.env
-
-# Ignore Go vendor output.
-vendor/
-
-# Ignore Python caches and virtual environments.
+buyer-env
+data-pipe/.buyer-env
+data-pipe/.env
+data-pipe/location-overrides.txt
+data-pipe/mlat-pipe
+data-pipe/correlation_groups.jsonl
+data-pipe/correlation_groups_1h.jsonl
+native-l45/build/
+.venv/
+venv/
 __pycache__/
 *.pyc
 *.pyo
-.venv/
-venv/
 *.egg-info/
-
-# Ignore frontend dependency and build directories.
-node_modules/
-dist/
-build/
-
-# Ignore OS metadata files.
-.DS_Store
-Thumbs.db
-
-# Ignore editor metadata.
+*.log
+layer4_native*.jsonl
+layer5_native*.jsonl
+*.exe
+*.out
 .vscode/
 .idea/
 *.swp
 *.swo
-
-# Ignore WireGuard config files.
-wg0.conf
-
-# Ignore MLAT data artifacts and logs.
-*.json
-*.log
-location-overrides.txt
-data-pipe/mlat-pipe
-solved.jsonl
+.DS_Store
+Thumbs.db

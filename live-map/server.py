@@ -18,11 +18,8 @@ from pathlib import Path
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
-
-# Add the solver directory to the import path for shared geo helpers.
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "mlat-solver"))
 from gdop import compute_gdop
 from geo import lla_to_ecef
 
@@ -168,6 +165,11 @@ async def index() -> HTMLResponse:
     """Serve the main map page."""
     index_path = static_dir / "index.html"
     return HTMLResponse(content=index_path.read_text())
+
+
+@app.get("/favicon.ico")
+async def favicon() -> Response:
+    return Response(status_code=204)
 
 
 @app.get("/api/aircraft")

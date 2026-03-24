@@ -8,12 +8,6 @@ import time
 import numpy as np
 
 from ekf import AircraftEKF
-
-# Add the solver directory to the import path for shared geo helpers.
-import os
-import sys
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "mlat-solver"))
-
 from geo import ecef_to_lla, lla_to_ecef
 
 # Limit the time a stale track can survive without updates.
