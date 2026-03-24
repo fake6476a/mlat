@@ -4,7 +4,7 @@
 **System:** AMD EPYC (2 cores, x86_64), GCC 11.4.0, Release build with LTO
 **Dataset:** `data-pipe/correlation_groups_1h.jsonl` — 165,917 correlation groups (57 MB)
 
-Two runs were performed: one **without** location overrides and one **with** the `location-override(2).json` file (9 sensors matched).
+Two runs were performed: one **without** location overrides and one **with** `data-pipe/location-overrides.txt` (9 sensors matched).
 
 ---
 
@@ -330,7 +330,7 @@ correlation_groups_1h.jsonl  (165,917 lines, 57 MB)
 
 ## 7. Impact of Location Overrides
 
-Enabling location overrides (9 sensors matched from `location-override(2).json`) had the following effects:
+Enabling location overrides (9 sensors matched from `data-pipe/location-overrides.txt`) had the following effects:
 
 | Metric | Change |
 |---|---|
@@ -358,4 +358,4 @@ Key takeaway: Location overrides provide **meaningful quality improvement** (esp
 - **Compiler:** GCC 11.4.0
 - **Build:** Release, LTO enabled, `-O3 -march=native`
 - **OS:** Linux (Ubuntu)
-- **Location overrides file:** `location-override(2).json` (9 sensors)
+- **Location overrides file:** `data-pipe/location-overrides.txt` (9 sensors)
