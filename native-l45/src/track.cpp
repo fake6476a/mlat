@@ -441,7 +441,11 @@ std::optional<TrackOutput> TrackManager::process_fix(const SolveFix& fix) {
   Vec3 position_ecef = lla_to_ecef(fix.lat, fix.lon, alt_m);
   double ts = static_cast<double>(fix.timestamp_s) + static_cast<double>(fix.timestamp_ns) * 1e-9;
   std::optional<double> meas_noise;
-  if (fix.quality_residual_m > 0.0 && fix.gdop > 0.0) {
+  if (fix.num_sensors == 2 && fix.gdop > 0.0) {
+    meas_noise = std::min(3000.0, std::max(500.0, fix.quality_residual_m * fix.gdop * 3.0));
+  } else if (fix.num_sensors == 2) {
+    meas_noise = std::min(3000.0, std::max(500.0, fix.quality_residual_m * 8.0));
+  } else if (fix.quality_residual_m > 0.0 && fix.gdop > 0.0) {
     meas_noise = std::min(2000.0, std::max(50.0, fix.quality_residual_m * fix.gdop));
   } else if (fix.quality_residual_m > 0.0) {
     meas_noise = std::min(2000.0, std::max(50.0, fix.quality_residual_m * 2.0));
@@ -475,15 +479,16 @@ std::optional<TrackOutput> TrackManager::solve_prediction_aided(const Group& gro
   if (it == tracks_.end() || !it->second.is_established()) {
     return std::nullopt;
   }
-  if (group.receptions.size() != 2 || !group.altitude_ft) {
+  int n_sensors = static_cast<int>(group.receptions.size());
+  if (n_sensors < 2 || !group.altitude_ft) {
     return std::nullopt;
   }
-  std::vector<Vec3> sensor_positions(2);
-  std::vector<double> sensor_alts_m(2);
-  std::vector<double> arrival_times(2);
+  std::vector<Vec3> sensor_positions(n_sensors);
+  std::vector<double> sensor_alts_m(n_sensors);
+  std::vector<double> arrival_times(n_sensors);
   int ref_idx = 0;
   long long ref_stamp = std::numeric_limits<long long>::max();
-  for (int i = 0; i < 2; ++i) {
+  for (int i = 0; i < n_sensors; ++i) {
     long long stamp = group.receptions[i].timestamp_s * 1000000000LL + group.receptions[i].timestamp_ns;
     if (stamp < ref_stamp) {
       ref_stamp = stamp;
@@ -492,7 +497,7 @@ std::optional<TrackOutput> TrackManager::solve_prediction_aided(const Group& gro
   }
   std::int64_t ref_timestamp_s = group.receptions[ref_idx].timestamp_s;
   std::int64_t ref_timestamp_ns = group.receptions[ref_idx].timestamp_ns;
-  for (int i = 0; i < 2; ++i) {
+  for (int i = 0; i < n_sensors; ++i) {
     sensor_positions[i] = group.receptions[i].sensor_ecef;
     sensor_alts_m[i] = group.receptions[i].alt;
     std::int64_t dt_s = group.receptions[i].timestamp_s - ref_timestamp_s;
@@ -503,8 +508,17 @@ std::optional<TrackOutput> TrackManager::solve_prediction_aided(const Group& gro
   Vec3 predicted_ecef = it->second.ekf.predict(target_ts);
   double pred_uncertainty = std::sqrt(it->second.ekf.P.m[0][0] + it->second.ekf.P.m[1][1] + it->second.ekf.P.m[2][2]);
   double pw = clamp(500.0 / std::max(pred_uncertainty, 1.0), 1.0, 12.0);
-  auto result = solve_toa(sensor_positions, arrival_times, sensor_alts_m, predicted_ecef, ft_to_m(*group.altitude_ft), predicted_ecef, 1000, pw);
+  auto result = solve_toa(sensor_positions, arrival_times, sensor_alts_m, predicted_ecef, ft_to_m(*group.altitude_ft), predicted_ecef, 50, pw);
   if (!result) {
+    return std::nullopt;
+  }
+  double max_residual = std::min(500.0, std::max(100.0, pred_uncertainty * 0.5));
+  if (result->residual_m > max_residual) {
+    return std::nullopt;
+  }
+  double pred_offset = norm(result->position - predicted_ecef);
+  double max_offset = std::min(5000.0, std::max(500.0, pred_uncertainty * 3.0));
+  if (pred_offset > max_offset) {
     return std::nullopt;
   }
   auto [lat, lon, alt] = ecef_to_lla(result->position.x, result->position.y, result->position.z);
@@ -517,8 +531,8 @@ std::optional<TrackOutput> TrackManager::solve_prediction_aided(const Group& gro
   solved_fix.residual_m = result->residual_m;
   solved_fix.quality_residual_m = result->objective_residual_m;
   solved_fix.gdop = 0.0;
-  solved_fix.num_sensors = 2;
-  solved_fix.solve_method = "prediction_aided_2sensor";
+  solved_fix.num_sensors = n_sensors;
+  solved_fix.solve_method = n_sensors == 2 ? "prediction_aided_2sensor" : "prediction_aided_" + std::to_string(n_sensors) + "sensor";
   solved_fix.timestamp_s = ref_timestamp_s;
   solved_fix.timestamp_ns = ref_timestamp_ns;
   solved_fix.df_type = group.df_type;

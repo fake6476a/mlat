@@ -196,7 +196,16 @@ void Layer4Processor::process_group(Group group, std::ostream& out) {
       }
     }
   }
-  auto outcome = solve_group(corrected_group, position_prior);
+  double prior_uncertainty_m = 500.0;
+  if (cached && msg_timestamp) {
+    double dt = std::abs(*msg_timestamp - cached->timestamp);
+    if (cached->velocity_ecef) {
+      prior_uncertainty_m = std::max(50.0, 0.5 * 50.0 * dt * dt + cached->residual_m);
+    } else {
+      prior_uncertainty_m = std::max(100.0, 300.0 * dt + cached->residual_m);
+    }
+  }
+  auto outcome = solve_group(corrected_group, position_prior, prior_uncertainty_m);
   if (outcome.result) {
     Vec3 aircraft_ecef = lla_to_ecef(outcome.result->lat, outcome.result->lon, ft_to_m(outcome.result->alt_ft));
     if (cached && msg_timestamp) {
@@ -209,7 +218,7 @@ void Layer4Processor::process_group(Group group, std::ostream& out) {
     out << to_json_fix(*outcome.result) << '\n';
     stats_.record_solve(outcome.result->solve_method, outcome.result->residual_m);
     if (msg_timestamp) {
-      pos_cache_.put(icao, aircraft_ecef, outcome.result->lat, outcome.result->lon, ft_to_m(outcome.result->alt_ft), *msg_timestamp, outcome.result->quality_residual_m);
+      pos_cache_.put(icao, aircraft_ecef, outcome.result->lat, outcome.result->lon, ft_to_m(outcome.result->alt_ft), *msg_timestamp, outcome.result->residual_m);
     }
     if (outcome.result->quality_residual_m < 200.0 && clock_cal_.has_any_calibration(receptions)) {
       clock_cal_.process_adsb_reference(aircraft_ecef, receptions, now);
@@ -229,8 +238,8 @@ void Layer4Processor::process_group(Group group, std::ostream& out) {
     if (!outcome.fail_reason.empty()) {
       ++stats_.failure_reasons[outcome.fail_reason];
     }
-    if (n_sensors == 2 && effective_alt_ft) {
-      out << to_json_unsolved_group(group) << '\n';
+    if (effective_alt_ft) {
+      out << to_json_unsolved_group(corrected_group) << '\n';
     }
   }
 }

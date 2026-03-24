@@ -167,7 +167,10 @@ bool CachedPosition::is_physically_consistent(const Vec3& new_ecef, double new_t
     Vec3 predicted = ecef + (*velocity_ecef) * (new_timestamp - timestamp);
     double prediction_error = norm(new_ecef - predicted);
     double max_deviation = 0.5 * kMaxAircraftAccelMps2 * dt * dt;
-    if (prediction_error > std::max(max_deviation + position_slack, 5000.0)) {
+    double base_tolerance = solve_count < 5 ? 10000.0 : 5000.0;
+    double residual_tolerance = 3.0 * (residual_m + new_residual_m);
+    double effective_tolerance = std::max({max_deviation + position_slack, base_tolerance, residual_tolerance});
+    if (prediction_error > effective_tolerance) {
       return false;
     }
   }

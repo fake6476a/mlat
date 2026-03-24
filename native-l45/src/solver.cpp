@@ -524,12 +524,19 @@ double compute_gdop_2d(const Vec3& aircraft_pos, const std::vector<Vec3>& sensor
   if (sensor_positions.size() < 2) {
     return std::numeric_limits<double>::infinity();
   }
-  auto [lat, lon, alt] = ecef_to_lla(aircraft_pos.x, aircraft_pos.y, aircraft_pos.z);
-  static_cast<void>(alt);
-  double lat_r = lat * M_PI / 180.0;
-  double lon_r = lon * M_PI / 180.0;
-  Vec3 east{-std::sin(lon_r), std::cos(lon_r), 0.0};
-  Vec3 north{-std::sin(lat_r) * std::cos(lon_r), -std::sin(lat_r) * std::sin(lon_r), std::cos(lat_r)};
+  double r_pos = norm(aircraft_pos);
+  if (r_pos < 1.0) {
+    return std::numeric_limits<double>::infinity();
+  }
+  Vec3 up = aircraft_pos / r_pos;
+  Vec3 pole{0.0, 0.0, 1.0};
+  Vec3 east_raw{pole.y * up.z - pole.z * up.y, pole.z * up.x - pole.x * up.z, pole.x * up.y - pole.y * up.x};
+  double east_len = norm(east_raw);
+  if (east_len < 1e-10) {
+    return std::numeric_limits<double>::infinity();
+  }
+  Vec3 east = east_raw / east_len;
+  Vec3 north{up.y * east.z - up.z * east.y, up.z * east.x - up.x * east.z, up.x * east.y - up.y * east.x};
   std::array<std::array<double, 2>, 2> hth{};
   for (const auto& sensor : sensor_positions) {
     Vec3 diff = aircraft_pos - sensor;
@@ -694,7 +701,7 @@ std::optional<ToaResult> solve_constrained_3sensor(
   return solve_toa(sensors, arrival_times, sensor_alts_m, x0, altitude_m, std::nullopt, 50, 8.0);
 }
 
-SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position_prior_ecef) {
+SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position_prior_ecef, double prior_uncertainty_m) {
   SolveOutcome outcome;
   int n_sensors = static_cast<int>(group.receptions.size());
   if (n_sensors < 2) {
@@ -776,7 +783,7 @@ SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position
       x0 = centroid_init(sensor_positions, altitude_m);
       solve_method = "centroid_init";
      }
-     double pw = n_sensors == 2 ? 8.0 : 3.0;
+     double pw = n_sensors == 2 ? clamp(500.0 / std::max(prior_uncertainty_m, 1.0), 1.0, 12.0) : 3.0;
      if (n_sensors == 2 && altitude_m && position_prior_ecef) {
        result = solve_toa(sensor_positions, arrival_times, sensor_alts_m, *x0, altitude_m, position_prior_ecef, kPrior2SensorMaxNfev, pw);
        if (result) {
@@ -824,7 +831,9 @@ SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position
     return outcome;
   }
   if (position_prior_ecef && n_sensors <= 3) {
-    double max_prior_drift = n_sensors == 2 ? kMaxPriorDrift2SensorM : kMaxPriorDriftM;
+    double base_drift = n_sensors == 2 ? kMaxPriorDrift2SensorM : kMaxPriorDriftM;
+    double drift_scale = std::min(3.0, std::max(1.0, kMaxResidualPriorM / std::max(residual_m, 10.0)));
+    double max_prior_drift = base_drift * drift_scale;
     if (prior_offset_m > max_prior_drift) {
       outcome.fail_reason = "prior_drift_exceeded";
       return outcome;
@@ -837,9 +846,9 @@ SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position
       outcome.fail_reason = "gdop_exceeded";
       return outcome;
     }
-  } else if (n_used == 3 && altitude_m) {
+  } else if (n_used >= 2 && altitude_m) {
     gdop = compute_gdop_2d(position, used_sensors);
-    if (gdop > kMaxGdop2d) {
+    if (n_used >= 3 && gdop > kMaxGdop2d) {
       outcome.fail_reason = "gdop_2d_exceeded";
       return outcome;
     }

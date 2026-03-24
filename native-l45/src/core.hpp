@@ -406,7 +406,7 @@ struct SolveOutcome {
   std::string fail_reason;
 };
 
-SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position_prior_ecef);
+SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position_prior_ecef, double prior_uncertainty_m = 500.0);
 
 class Layer4Stats {
  public:

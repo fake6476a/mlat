@@ -23,3 +23,4 @@ layer5_native*.jsonl
 *.swo
 .DS_Store
 Thumbs.db
+build
