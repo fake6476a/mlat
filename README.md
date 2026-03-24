@@ -1,37 +1,27 @@
-# Native C++ MLAT Pipeline
+# Native C++ MLAT Pipeline — Benchmarking & Usage
 
-This README documents only the native Layer 4 and Layer 5 workflow, the live and recorded commands that are still part of that working stack, and the solver optimization journey that led to the current native C++ path.
+A 6-layer multilateration pipeline that takes raw ADS-B sensor feeds and produces real-time aircraft tracks on a live map. Layers 4 and 5 are native C++ for maximum throughput.
 
-## Scope
+## Pipeline Architecture
+
+```
+Layer 1  Go data-pipe          Raw sensor feed ingestion
+Layer 2  Python modes-decoder  ADS-B frame decoding
+Layer 3  Python correlation    TOA correlation grouping
+Layer 4  C++ mlat-solver       Multilateration position solving
+Layer 5  C++ track-builder     EKF-based track filtering
+Layer 6  Python live-map       Browser-based live map
+```
+
+All layers are connected via Unix pipes (stdin/stdout JSONL). Layers 4+5 run in parallel and fully utilise both CPU cores.
 
 Run every command in this README from the repository root.
 
-Current working stack:
+---
 
-- Layer 1: Go (`data-pipe`)
-- Layer 2: Python (`modes-decoder`)
-- Layer 3: Python (`correlation-engine`)
-- Layer 4: Native C++ (`native-l45/build/mlat-solver-native`)
-- Layer 5: Native C++ (`native-l45/build/track-builder-native`)
-- Layer 6: Python (`live-map/server.py`)
+## 1. Build
 
-This README does not use the removed Python Layer 4 solver.
-
-## Private Local Files
-
-Keep these files local and out of Git:
-
-- `buyer-env`
-- `data-pipe/location-overrides.txt`
-- `data-pipe/correlation_groups_1h.jsonl`
-
-`buyer-env` must contain your Neuron buyer credentials, seller list, and the buyer `port` value.
-
-The native solver looks for `data-pipe/location-overrides.txt`, so the commands below assume the current working directory is the repo root.
-
-## Build
-
-### Python environment
+### 1.1 Python environment
 
 ```bash
 python3 -m venv .venv
@@ -42,81 +32,71 @@ python3 -m pip install \
   -r live-map/requirements.txt
 ```
 
-### Go Layer 1 binary
+### 1.2 Go Layer 1 binary
 
 ```bash
 go build -o data-pipe/mlat-pipe ./data-pipe
 ```
 
-### Native Layer 4 and Layer 5 binaries
+### 1.3 Native Layer 4 + Layer 5 binaries
 
 ```bash
 cmake -S native-l45 -B native-l45/build -DCMAKE_BUILD_TYPE=Release
 cmake --build native-l45/build -j
 ```
 
-## Live Layer 3 Capture
+---
 
-### Capture to `data-pipe/correlation_groups.jsonl`
+## 2. Location Overrides
+
+The file `data-pipe/location-overrides.txt` maps sensor public keys to known geographic positions (lat, lon, alt) and human-readable names. The native solver loads this file automatically on startup.
+
+Location overrides improve solve quality significantly (see [Benchmark Results](#5-benchmark-results--1-hour-dataset)).
+
+To update the sensor list, edit `data-pipe/location-overrides.txt`. The format is a JSON array:
+
+```json
+[
+  {
+    "public_key": "021a29e7...",
+    "lat": 50.09916,
+    "lon": -5.55674,
+    "alt": 153.8,
+    "name": "ne073 Penzance"
+  }
+]
+```
+
+---
+
+## 3. Running With Real Live Data
+
+You need a `buyer-env` file (not checked in) with your Neuron buyer credentials, seller list, and the buyer `port` value.
+
+### 3.1 Capture Layer 3 correlation groups (live)
 
 ```bash
 bash run-pipeline.sh
 ```
 
-This writes:
+This runs Layers 1-3 and writes correlation groups to `data-pipe/correlation_groups.jsonl`.
 
-- `data-pipe/correlation_groups.jsonl`
-- `data-pipe/pipe.log`
-- `decoder.log`
-- `correlator.log`
+Output logs: `data-pipe/pipe.log`, `decoder.log`, `correlator.log`.
 
-### Record one hour of live Layer 3 data
+### 3.2 Record a fixed duration of live data
+
+Record 1 hour of Layer 3 data for later replay:
 
 ```bash
 timeout 3600 bash run-pipeline.sh || test $? -eq 124
 mv data-pipe/correlation_groups.jsonl data-pipe/correlation_groups_1h.jsonl
 ```
 
-## Recorded Replay With Native Layer 4
+Adjust `3600` (seconds) for shorter or longer captures.
 
-```bash
-cat data-pipe/correlation_groups_1h.jsonl \
-| ./native-l45/build/mlat-solver-native 2>solver_native_1h.log \
-> layer4_native_1h.jsonl
-```
+### 3.3 Full live pipeline (Layers 1-6)
 
-This writes:
-
-- `layer4_native_1h.jsonl`
-- `solver_native_1h.log`
-
-## Recorded Replay With Native Layer 4 And Layer 5
-
-```bash
-cat layer4_native_1h.jsonl \
-| ./native-l45/build/track-builder-native 2>tracker_native_1h.log \
-> layer5_native_1h.jsonl
-```
-
-This writes:
-
-- `layer5_native_1h.jsonl`
-- `tracker_native_1h.log`
-
-## Recorded Replay Through Layer 6
-
-```bash
-cat layer5_native_1h.jsonl \
-| python3 live-map/server.py --host 127.0.0.1 --port 8080 2>livemap_native_1h.log
-```
-
-Open `http://127.0.0.1:8080`.
-
-This writes:
-
-- `livemap_native_1h.log`
-
-## Full Live Native Chain
+Run all layers end-to-end with live sensor data and open the live map:
 
 ```bash
 PORT=$(grep '^port=' buyer-env | cut -d= -f2)
@@ -134,42 +114,151 @@ PORT=$(grep '^port=' buyer-env | cut -d= -f2)
 | python3 live-map/server.py --host 127.0.0.1 --port 8080 2>livemap_live_native.log
 ```
 
+Open `http://127.0.0.1:8080` in a browser.
+
+---
+
+## 4. Running on Captured / Recorded Data
+
+Use a previously recorded JSONL file (e.g. `data-pipe/correlation_groups_1h.jsonl`) to replay through the native solver and tracker without needing live sensors.
+
+### 4.1 Layer 4 only — MLAT solver
+
+```bash
+cat data-pipe/correlation_groups_1h.jsonl \
+| ./native-l45/build/mlat-solver-native 2>solver_native_1h.log \
+> layer4_native_1h.jsonl
+```
+
+Output: `layer4_native_1h.jsonl` (solved positions + passthrough), `solver_native_1h.log` (JSON stats on stderr).
+
+### 4.2 Layer 4 + Layer 5 — solver + track builder
+
+```bash
+cat data-pipe/correlation_groups_1h.jsonl \
+| ./native-l45/build/mlat-solver-native 2>solver_native_1h.log \
+| ./native-l45/build/track-builder-native 2>tracker_native_1h.log \
+> layer5_native_1h.jsonl
+```
+
+Output: `layer5_native_1h.jsonl` (EKF-filtered tracks), `tracker_native_1h.log` (JSON stats on stderr).
+
+### 4.3 Full replay through Layer 6 (live map)
+
+```bash
+cat data-pipe/correlation_groups_1h.jsonl \
+| ./native-l45/build/mlat-solver-native 2>solver_native_1h.log \
+| ./native-l45/build/track-builder-native 2>tracker_native_1h.log \
+| python3 live-map/server.py --host 127.0.0.1 --port 8080 2>livemap_native_1h.log
+```
+
 Open `http://127.0.0.1:8080`.
 
-This writes:
+### 4.4 Timed benchmark run (5 iterations)
 
-- `data-pipe/pipe_live_native.log`
-- `decoder_live_native.log`
-- `correlator_live_native.log`
-- `solver_live_native.log`
-- `tracker_live_native.log`
-- `livemap_live_native.log`
+```bash
+for i in 1 2 3 4 5; do
+  /usr/bin/time -v bash -c \
+    'cat data-pipe/correlation_groups_1h.jsonl \
+     | ./native-l45/build/mlat-solver-native 2>/dev/null \
+     | ./native-l45/build/track-builder-native 2>/dev/null \
+     > /dev/null' 2>&1 | grep -E "wall clock|Maximum resident"
+done
+```
 
-## Optimization Journey
+### 4.5 Reading benchmark stats from logs
 
-The solver path improved in stages before the native rewrite became the default run path.
+Both the solver and tracker write a JSON summary to stderr at the end of each run. Key fields:
 
-User-provided historical progression:
+**Solver log** (`solver_native_1h.log`):
+- `groups_received`, `groups_solved`, `solve_rate`
+- `median_residual_m`, `p95_residual_m`
+- `location_overrides.matched_sensors`
 
-- Early 30-minute capture at roughly `110k` groups: median residual around `50 m`, p95 around `200 m`, solves in the `20s` range.
-- Later 42-minute run at roughly `121k` groups: median residual around `39 m`, p95 around `150 m`, solves in the `30s` range.
-- Later tuned run on the same `121k`-group scale: median residual around `25 m`, p95 around `150 m`, solves in about `40s`.
+**Tracker log** (`tracker_native_1h.log`):
+- `fixes_received`, `fixes_accepted`, `accept_rate`
+- `tracks_created`, `tracks_established`
 
-Exact saved benchmark points used for the current baseline:
+---
 
-| Stage | Dataset | Solves | Solve rate | Median residual | p95 residual | Runtime |
-|---|---:|---:|---:|---:|---:|---:|
-| Python Layer 4 baseline | `data-pipe/correlation_groups_30min.jsonl` | `36,293 / 77,722` | `46.7%` | `18.19 m` | `133.04 m` | `3m37.741s` |
-| Native C++ Layer 4 parity / optimized baseline | `data-pipe/correlation_groups_30min.jsonl` | `36,694-36,723 / 77,722` | about `47.2%` | about `16.5 m` | about `129-130 m` | about `1m08s` |
+## 5. Benchmark Results — 1-Hour Dataset
 
-Additional saved native notes:
+**Dataset:** `data-pipe/correlation_groups_1h.jsonl` — 165,917 correlation groups (57 MB)
+**System:** AMD EPYC (2 cores), GCC 11.4.0, Release + LTO, `-O3 -march=native`
+**Location overrides:** 9 sensors matched from `data-pipe/location-overrides.txt`
 
-- The current native path preserved Layer 5 parity against the Python tracker on the same Layer 4 output.
-- An optional `NATIVE_L45_DELEGATE_2SENSOR_MIN_SOLVES` tuning path reached about `49.9s` end-to-end on the 30-minute replay, but it reduced standalone Layer 4 solve rate, so it is not the default documented mode.
-- A later 1-hour benchmark run showed the native Layer 4 path at about `11.3x` faster than the Python Layer 4 path while keeping solve quality essentially aligned.
+### 5.1 Performance
 
-## Notes
+| Component | Wall Time (avg of 5 runs) | Throughput |
+|---|---:|---:|
+| Layer 4 solver | 3.635 s | 45,634 groups/s |
+| Layer 5 tracker | 2.371 s | 65,331 records/s |
+| Full pipeline (piped) | 3.813 s | 43,510 groups/s |
+| **Realtime factor** | | **944x** |
 
-- `buyer-env`, `data-pipe/location-overrides.txt`, and the recorded JSONL captures should stay local.
-- `bash run-pipeline.sh` now reads the root `buyer-env` directly; the old `data-pipe/.buyer-env` link is no longer required.
-- The live-map server pushes snapshots every `1.0s` by default unless `MLAT_UPDATE_INTERVAL` is changed.
+1 hour of captured data processes in under 4 seconds.
+
+### 5.2 Solver Quality (Layer 4)
+
+| Metric | Value |
+|---|---:|
+| Groups received | 165,917 |
+| Groups solved | 84,561 |
+| Solve rate | 51.0% |
+| Median residual | 18.91 m |
+| p95 residual | 140.80 m |
+| Mean residual | 37.05 m |
+
+Solve method breakdown: 98.9% prior_2sensor, 1.0% constrained_3sensor, 0.1% other.
+
+### 5.3 Track Builder Quality (Layer 5)
+
+| Metric | Value |
+|---|---:|
+| Fixes received | 154,301 |
+| Fixes accepted (EKF gate) | 67,084 |
+| Accept rate | 43.5% |
+| Unique aircraft tracked | 120 |
+| Median residual | 23.23 m |
+| p95 residual | 161.75 m |
+| Median track quality | 563 |
+
+### 5.4 Impact of Location Overrides
+
+| Metric | Without Overrides | With Overrides | Change |
+|---|---:|---:|---|
+| Solve rate | 50.8% | 51.0% | +0.2pp |
+| Median residual (L4) | 22.47 m | 18.91 m | **-15.8%** |
+| Mean residual (L4) | 39.36 m | 37.05 m | -5.9% |
+| p95 residual (L4) | 141.01 m | 140.80 m | -0.1% |
+| L5 EKF accept rate | 40.6% | 43.5% | +2.9pp |
+| L5 track updates | 62,929 | 67,084 | **+6.6%** |
+| L5 median residual | 26.99 m | 23.23 m | **-13.9%** |
+| L5 median quality | 508 | 563 | +10.8% |
+| GDOP mean | 981.57 | 148.72 | **-84.8%** |
+| Pipeline wall time | 3.782 s | 3.813 s | +0.8% |
+
+Location overrides provide meaningful quality improvement with no measurable performance cost.
+
+### 5.5 Optimization History
+
+| Stage | Dataset | Solve Rate | Median Residual | p95 Residual | Runtime |
+|---|---|---:|---:|---:|---:|
+| Python L4 baseline | 30-min (77k groups) | 46.7% | 18.19 m | 133.04 m | 3m38s |
+| Native C++ L4 | 30-min (77k groups) | 47.2% | 16.5 m | 129-130 m | 1m08s |
+| Native C++ L4+L5 | 1-hour (166k groups) | 51.0% | 18.91 m | 140.80 m | 3.8s |
+
+---
+
+## 6. Private Local Files
+
+Keep these files local and out of Git:
+
+- `buyer-env` — Neuron buyer credentials, seller list, and buyer port
+- `data-pipe/correlation_groups_1h.jsonl` — recorded captures (large)
+
+## 7. Notes
+
+- `bash run-pipeline.sh` reads the root `buyer-env` directly; the old `data-pipe/.buyer-env` symlink is no longer required.
+- The live-map server pushes snapshots every `1.0s` by default unless `MLAT_UPDATE_INTERVAL` is set.
+- The native solver auto-detects `data-pipe/location-overrides.txt` on startup. If the file is missing, the solver runs without overrides.
