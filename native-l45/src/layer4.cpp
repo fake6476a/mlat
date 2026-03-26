@@ -205,7 +205,7 @@ void Layer4Processor::process_group(Group group, std::ostream& out) {
       prior_uncertainty_m = std::max(100.0, 300.0 * dt + cached->residual_m);
     }
   }
-  auto outcome = solve_group(corrected_group, position_prior, prior_uncertainty_m);
+  auto outcome = solve_group(corrected_group, position_prior, prior_uncertainty_m, &bias_tracker_);
   if (outcome.result) {
     Vec3 aircraft_ecef = lla_to_ecef(outcome.result->lat, outcome.result->lon, ft_to_m(outcome.result->alt_ft));
     if (cached && msg_timestamp) {
@@ -260,6 +260,7 @@ void Layer4Processor::finish(std::ostream& log) const {
   log << ",\"cpr_cache_seeds\":" << cpr_seeds_;
   log << ",\"df17_alt_extracted\":" << df17_alt_extracted_;
   log << ",\"cached_alt_used\":" << cached_alt_used_;
+  log << ",\"sensor_bias\":" << bias_tracker_.stats_json();
   if (override_map_) {
     log << ",\"location_overrides\":" << override_map_->stats_json();
   }

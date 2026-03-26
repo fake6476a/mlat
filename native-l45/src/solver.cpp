@@ -257,7 +257,7 @@ void evaluate_objective(
   }
 }
 
-double soft_l1_cost(const std::vector<double>& residuals, double f_scale = 500.0) {
+double soft_l1_cost(const std::vector<double>& residuals, double f_scale) {
   double total = 0.0;
   for (double r : residuals) {
     double z = (r / f_scale) * (r / f_scale);
@@ -266,7 +266,7 @@ double soft_l1_cost(const std::vector<double>& residuals, double f_scale = 500.0
   return total;
 }
 
-double soft_l1_row_scale(double residual, double f_scale = 500.0) {
+double soft_l1_row_scale(double residual, double f_scale) {
   double z = (residual / f_scale) * (residual / f_scale);
   return std::sqrt(1.0 / std::sqrt(1.0 + z));
 }
@@ -279,7 +279,8 @@ std::optional<ToaResult> solve_toa_impl(
     const std::optional<double>& altitude_m,
     const std::optional<Vec3>& track_prediction_ecef,
     int max_nfev,
-    double prediction_weight) {
+    double prediction_weight,
+    double f_scale = 500.0) {
   if (sensors.size() < 2 || sensors.size() != arrival_times.size() || sensors.size() != sensor_alts_m.size()) {
     return std::nullopt;
   }
@@ -294,7 +295,7 @@ std::optional<ToaResult> solve_toa_impl(
   eval.reserve(sensors.size(), has_altitude, has_prediction);
   candidate_eval.reserve(sensors.size(), has_altitude, has_prediction);
   evaluate_objective(x, sensors, arrival_times, velocities, altitude_m, track_prediction_ecef, prediction_weight, timing, eval, true);
-  double best_cost = soft_l1_cost(eval.objective_residuals);
+  double best_cost = soft_l1_cost(eval.objective_residuals, f_scale);
   if (!std::isfinite(best_cost)) {
     return std::nullopt;
   }
@@ -304,7 +305,7 @@ std::optional<ToaResult> solve_toa_impl(
     std::array<std::array<double, 3>, 3> a{};
     std::array<double, 3> b{};
     for (std::size_t i = 0; i < eval.objective_residuals.size(); ++i) {
-      double scale = soft_l1_row_scale(eval.objective_residuals[i]);
+      double scale = soft_l1_row_scale(eval.objective_residuals[i], f_scale);
       double rw = eval.objective_residuals[i] * scale;
       std::array<double, 3> jw = {
           eval.jacobian[i][0] * scale,
@@ -328,7 +329,7 @@ std::optional<ToaResult> solve_toa_impl(
     Vec3 candidate = x + Vec3{dx[0], dx[1], dx[2]};
     evaluate_objective(candidate, sensors, arrival_times, velocities, altitude_m, track_prediction_ecef, prediction_weight, candidate_timing, candidate_eval, true);
     ++nfev;
-    double candidate_cost = soft_l1_cost(candidate_eval.objective_residuals);
+    double candidate_cost = soft_l1_cost(candidate_eval.objective_residuals, f_scale);
     if (!std::isfinite(candidate_cost)) {
       lambda = std::min(lambda * 10.0, 1e12);
       continue;
@@ -685,8 +686,10 @@ std::optional<ToaResult> solve_toa(
     const std::optional<Vec3>& track_prediction_ecef,
     int max_nfev,
     double prediction_weight) {
+  // Use tighter f_scale for 2-sensor solves to downweight outlier TOA measurements
+  double f_scale = sensors.size() <= 2 ? 250.0 : 500.0;
   try {
-    return solve_toa_impl(sensors, arrival_times, sensor_alts_m, x0, altitude_m, track_prediction_ecef, max_nfev, prediction_weight);
+    return solve_toa_impl(sensors, arrival_times, sensor_alts_m, x0, altitude_m, track_prediction_ecef, max_nfev, prediction_weight, f_scale);
   } catch (...) {
     return std::nullopt;
   }
@@ -701,7 +704,7 @@ std::optional<ToaResult> solve_constrained_3sensor(
   return solve_toa(sensors, arrival_times, sensor_alts_m, x0, altitude_m, std::nullopt, 50, 8.0);
 }
 
-SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position_prior_ecef, double prior_uncertainty_m) {
+SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position_prior_ecef, double prior_uncertainty_m, const SensorBiasTracker* bias_tracker) {
   SolveOutcome outcome;
   int n_sensors = static_cast<int>(group.receptions.size());
   if (n_sensors < 2) {
@@ -749,6 +752,8 @@ SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position
     std::int64_t dt_ns = group.receptions[i].timestamp_ns - ref_timestamp_ns;
     arrival_times[i] = static_cast<double>(dt_s) + static_cast<double>(dt_ns) * 1e-9;
   }
+  // Note: bias_tracker parameter reserved for future use
+  (void)bias_tracker;
   int min_sensors_needed = 0;
   if (altitude_m && position_prior_ecef) {
     min_sensors_needed = kMinSensorsWithPrior;
@@ -783,7 +788,20 @@ SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position
       x0 = centroid_init(sensor_positions, altitude_m);
       solve_method = "centroid_init";
      }
-     double pw = n_sensors == 2 ? clamp(500.0 / std::max(prior_uncertainty_m, 1.0), 1.0, 12.0) : 3.0;
+     double pw = 3.0;
+     if (n_sensors == 2) {
+       double base_pw = clamp(500.0 / std::max(prior_uncertainty_m, 1.0), 1.0, 12.0);
+       // Compute pre-solve GDOP estimate from prior position to modulate prediction weight
+       if (position_prior_ecef) {
+         double pre_gdop = compute_gdop_2d(*position_prior_ecef, sensor_positions);
+         // Poor geometry (high GDOP) -> trust prior more (higher weight)
+         // Good geometry (low GDOP) -> trust measurements more (lower weight)
+         double gdop_factor = clamp(pre_gdop / 3.0, 0.8, 2.5);
+         pw = clamp(base_pw * gdop_factor, 1.0, 15.0);
+       } else {
+         pw = base_pw;
+       }
+     }
      if (n_sensors == 2 && altitude_m && position_prior_ecef) {
        result = solve_toa(sensor_positions, arrival_times, sensor_alts_m, *x0, altitude_m, position_prior_ecef, kPrior2SensorMaxNfev, pw);
        if (result) {

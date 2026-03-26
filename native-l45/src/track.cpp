@@ -190,7 +190,9 @@ double AircraftEKF::update(const Vec3& measurement, double timestamp_s, std::opt
   }
   auto tmp = mat3_vec(s_inv, y);
   double mahal_sq = y[0] * tmp[0] + y[1] * tmp[1] + y[2] * tmp[2];
-  if (mahal_sq > kChi2Gate3Dof) {
+  // Adaptive gate: tighter for established tracks (>10 updates) to reject outliers
+  double effective_gate = updates >= 10 ? 11.34 : kChi2Gate3Dof;  // 99% vs 99.7%
+  if (mahal_sq > effective_gate) {
     return -1.0;
   }
   double mahal = std::sqrt(mahal_sq);
@@ -442,9 +444,12 @@ std::optional<TrackOutput> TrackManager::process_fix(const SolveFix& fix) {
   double ts = static_cast<double>(fix.timestamp_s) + static_cast<double>(fix.timestamp_ns) * 1e-9;
   std::optional<double> meas_noise;
   if (fix.num_sensors == 2 && fix.gdop > 0.0) {
-    meas_noise = std::min(3000.0, std::max(500.0, fix.quality_residual_m * fix.gdop * 3.0));
+    // Better scaling: lower floor for good-quality 2-sensor fixes
+    double noise_floor = fix.quality_residual_m < 50.0 ? 200.0 : 400.0;
+    meas_noise = std::min(3000.0, std::max(noise_floor, fix.quality_residual_m * fix.gdop * 2.5));
   } else if (fix.num_sensors == 2) {
-    meas_noise = std::min(3000.0, std::max(500.0, fix.quality_residual_m * 8.0));
+    double noise_floor = fix.quality_residual_m < 50.0 ? 250.0 : 400.0;
+    meas_noise = std::min(3000.0, std::max(noise_floor, fix.quality_residual_m * 6.0));
   } else if (fix.quality_residual_m > 0.0 && fix.gdop > 0.0) {
     meas_noise = std::min(2000.0, std::max(50.0, fix.quality_residual_m * fix.gdop));
   } else if (fix.quality_residual_m > 0.0) {

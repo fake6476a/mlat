@@ -534,6 +534,68 @@ std::string ClockCalibrator::stats_json() const {
   return os.str();
 }
 
+void SensorBiasTracker::record_residual(std::int64_t sensor_id, double timing_residual_s) {
+  auto& state = biases_[sensor_id];
+  ++state.count;
+  if (state.count == 1) {
+    state.mean = timing_residual_s;
+    state.variance = 0.0;
+    return;
+  }
+  // Exponentially-weighted moving average with effective window ~200 samples
+  constexpr double kAlpha = 0.005;
+  double delta = timing_residual_s - state.mean;
+  state.mean += kAlpha * delta;
+  state.variance = (1.0 - kAlpha) * (state.variance + kAlpha * delta * delta);
+}
+
+std::optional<double> SensorBiasTracker::get_bias_s(std::int64_t sensor_id) const {
+  auto it = biases_.find(sensor_id);
+  if (it == biases_.end() || it->second.count < 20) {
+    return std::nullopt;
+  }
+  return it->second.mean;
+}
+
+std::vector<double> SensorBiasTracker::apply_corrections(const std::vector<double>& arrival_times, const std::vector<Reception>& receptions) const {
+  std::vector<double> corrected = arrival_times;
+  for (std::size_t i = 0; i < receptions.size() && i < corrected.size(); ++i) {
+    auto bias = get_bias_s(receptions[i].sensor_id);
+    if (bias) {
+      corrected[i] -= *bias;
+    }
+  }
+  return corrected;
+}
+
+std::string SensorBiasTracker::stats_json() const {
+  std::ostringstream os;
+  os << '{';
+  os << "\"tracked_sensors\":" << biases_.size();
+  int calibrated = 0;
+  for (const auto& [id, state] : biases_) {
+    if (state.count >= 20) {
+      ++calibrated;
+    }
+  }
+  os << ",\"calibrated_sensors\":" << calibrated;
+  os << ",\"sensor_biases\":{";
+  bool first = true;
+  for (const auto& [id, state] : biases_) {
+    if (state.count < 20) continue;
+    if (!first) os << ',';
+    first = false;
+    os << '"' << id << "\":{";
+    os << "\"bias_ns\":" << round_to(state.mean * 1e9, 1);
+    os << ",\"bias_m\":" << round_to(state.mean * kVacuumC, 1);
+    os << ",\"std_m\":" << round_to(std::sqrt(state.variance) * kVacuumC, 1);
+    os << ",\"n\":" << state.count;
+    os << '}';
+  }
+  os << "}}";
+  return os.str();
+}
+
 void Layer4Stats::record_solve(const std::string& method, double residual_m) {
   ++groups_solved;
   ++method_counts[method];
