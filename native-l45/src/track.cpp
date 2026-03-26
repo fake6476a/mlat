@@ -12,7 +12,7 @@ namespace native_l45 {
 
 namespace {
 
-constexpr double kChi2Gate3Dof = 14.16;
+constexpr double kChi2Gate3Dof = 16.27;
 constexpr double kMaxPredictGapS = 60.0;
 constexpr double kProcessNoiseAccel = 5.0;
 constexpr double kMeasurementNoiseM = 200.0;

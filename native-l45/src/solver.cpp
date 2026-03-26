@@ -13,11 +13,11 @@ namespace {
 
 constexpr double kMaxRangeM = 500000.0;
 constexpr double kMaxGdop = 20.0;
-constexpr double kMaxGdop2d = 10.0;
+constexpr double kMaxGdop2d = 12.0;
 constexpr double kMaxResidualM = 10000.0;
 constexpr double kMaxResidualPriorM = 200.0;
 constexpr double kMaxPriorDriftM = 30000.0;
-constexpr double kMaxPriorDrift2SensorM = 5000.0;
+constexpr double kMaxPriorDrift2SensorM = 6500.0;
 constexpr int kMinSensorsNoAlt = 4;
 constexpr int kMinSensorsWithAlt = 3;
 constexpr int kMinSensorsWithPrior = 2;
