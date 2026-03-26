@@ -232,8 +232,6 @@ void Layer4Processor::process_group(Group group, std::ostream& out) {
       double actual_arr = arr_time - outcome.result->t0_s;
       double residual_m = (actual_arr - expected_arr) * kVacuumC;
       stats_.record_sensor_residual(rec.sensor_id, residual_m);
-      double timing_residual_s = (actual_arr - expected_arr);
-      bias_tracker_.record_residual(rec.sensor_id, timing_residual_s);
     }
   } else {
     ++stats_.groups_failed;

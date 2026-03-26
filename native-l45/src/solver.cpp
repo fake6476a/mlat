@@ -752,9 +752,8 @@ SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position
     std::int64_t dt_ns = group.receptions[i].timestamp_ns - ref_timestamp_ns;
     arrival_times[i] = static_cast<double>(dt_s) + static_cast<double>(dt_ns) * 1e-9;
   }
-  if (bias_tracker) {
-    arrival_times = bias_tracker->apply_corrections(arrival_times, group.receptions);
-  }
+  // Note: bias_tracker parameter reserved for future use
+  (void)bias_tracker;
   int min_sensors_needed = 0;
   if (altitude_m && position_prior_ecef) {
     min_sensors_needed = kMinSensorsWithPrior;
