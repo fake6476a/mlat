@@ -1,7 +1,6 @@
 buyer-env
 data-pipe/.buyer-env
 data-pipe/.env
-data-pipe/location-overrides.txt
 data-pipe/mlat-pipe
 data-pipe/correlation_groups.jsonl
 data-pipe/correlation_groups_1h.jsonl
