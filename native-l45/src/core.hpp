@@ -406,7 +406,23 @@ struct SolveOutcome {
   std::string fail_reason;
 };
 
-SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position_prior_ecef, double prior_uncertainty_m = 500.0);
+class SensorBiasTracker {
+ public:
+  void record_residual(std::int64_t sensor_id, double timing_residual_s);
+  std::optional<double> get_bias_s(std::int64_t sensor_id) const;
+  std::vector<double> apply_corrections(const std::vector<double>& arrival_times, const std::vector<Reception>& receptions) const;
+  std::string stats_json() const;
+
+ private:
+  struct BiasState {
+    double mean = 0.0;
+    double variance = 0.0;
+    int count = 0;
+  };
+  std::unordered_map<std::int64_t, BiasState> biases_;
+};
+
+SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position_prior_ecef, double prior_uncertainty_m = 500.0, const SensorBiasTracker* bias_tracker = nullptr);
 
 class Layer4Stats {
  public:
@@ -438,6 +454,7 @@ class Layer4Processor {
   ClockCalibrator clock_cal_;
   PositionCache pos_cache_;
   CPRBuffer cpr_buffer_;
+  SensorBiasTracker bias_tracker_;
   std::optional<SensorOverrideMap> override_map_;
   int cpr_seeds_ = 0;
   int df17_alt_extracted_ = 0;
