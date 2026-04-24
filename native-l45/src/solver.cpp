@@ -21,7 +21,8 @@ constexpr double kMaxRangeM = 500000.0;
 constexpr double kMaxGdop = 20.0;                   // 3D GDOP cap (>=4 sensors)
 constexpr double kMaxGdop2d = 10.0;                  // 2D GDOP cap (2-3 sensors)
 constexpr double kMaxResidualM = 10000.0;            // general residual cap
-constexpr double kMaxResidualPriorM = 200.0;         // residual cap for prior-aided solves
+constexpr double kMaxResidualPriorM = 230.0;         // residual cap for prior-aided solves (good geometry)
+constexpr double kMaxResidualPriorTightM = 200.0;    // tight residual cap for poor-geometry prior solves
 constexpr double kMaxPriorDriftM = 30000.0;          // max drift from prior (3+ sensors)
 constexpr double kMaxPriorDrift2SensorM = 5000.0;    // max drift from prior (2 sensors)
 constexpr int kMinSensorsNoAlt = 4;                  // min sensors without altitude
@@ -824,6 +825,21 @@ SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position
        if (result) {
          solve_method = "prior_2sensor";
        }
+       // Multi-start: retry with alternative prediction weights when the
+       // initial residual is above the quality floor.  Tries a weaker
+       // weight (more freedom from prior) and a stronger weight (tighter
+       // prior constraint).  Early-exits once the residual is good.
+       if (!result || result->residual_m > 50.0) {
+         const double pw_alts[2] = {clamp(pw * 0.4, 0.5, 6.0), clamp(pw * 1.8, 1.0, 12.0)};
+         for (int i = 0; i < 2; ++i) {
+           if (result && result->residual_m < 50.0) break;
+           auto alt = solve_toa(sensor_positions, arrival_times, sensor_alts_m, *x0, altitude_m, position_prior_ecef, kPrior2SensorMaxNfev, pw_alts[i]);
+           if (alt && (!result || alt->residual_m < result->residual_m)) {
+             result = alt;
+             solve_method = "prior_2sensor";
+           }
+         }
+       }
      } else if (n_sensors == 3 && altitude_m) {
       result = solve_constrained_3sensor(sensor_positions, arrival_times, sensor_alts_m, *altitude_m, *x0);
       if (result && (solve_method == "centroid_init" || solve_method == "prior_aided" || solve_method == "grid_search")) {
@@ -855,7 +871,13 @@ SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position
   }
   double effective_max_residual = kMaxResidualM;
   if (n_sensors == 2 && position_prior_ecef) {
-    effective_max_residual = kMaxResidualPriorM;
+    // Use the tight cap when 2D GDOP is poor; otherwise allow the relaxed cap.
+    double gdop_2d_val = compute_gdop_2d(position, used_sensors);
+    if (gdop_2d_val > 5.0 || prior_offset_m > 500.0) {
+      effective_max_residual = kMaxResidualPriorTightM;
+    } else {
+      effective_max_residual = kMaxResidualPriorM;
+    }
   } else if (n_used == 3 && altitude_m) {
     effective_max_residual = 2000.0;
   } else if (n_used >= 4) {

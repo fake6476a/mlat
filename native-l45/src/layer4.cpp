@@ -152,6 +152,16 @@ void Layer4Processor::process_group(Group group, std::ostream& out) {
       ++cached_alt_used_;
     }
   }
+  // Fallback: for 3-sensor groups without any altitude, derive altitude from
+  // position cache if a prior exists. This enables constrained_3sensor solving
+  // for groups that would otherwise require 4 sensors.
+  if (!effective_alt_ft && n_sensors == 3 && msg_timestamp) {
+    auto cached_for_alt = pos_cache_.get(icao, *msg_timestamp);
+    if (cached_for_alt && cached_for_alt->solve_count >= 3) {
+      effective_alt_ft = std::round(cached_for_alt->alt_m / 0.3048);
+      ++cached_alt_used_;
+    }
+  }
   Group working_group = group;
   if (effective_alt_ft != group.altitude_ft) {
     working_group.altitude_ft = effective_alt_ft;
@@ -200,12 +210,33 @@ void Layer4Processor::process_group(Group group, std::ostream& out) {
   if (cached && msg_timestamp) {
     double dt = std::abs(*msg_timestamp - cached->timestamp);
     if (cached->velocity_ecef) {
-      prior_uncertainty_m = std::max(50.0, 0.5 * 50.0 * dt * dt + cached->residual_m);
+      // Adaptive acceleration uncertainty: use 15 m/s² (~1.5g) for stable tracks
+      // with >=5 solves, 50 m/s² (original, ~5g) for newer/less reliable tracks.
+      double accel_uncertainty = (cached->solve_count >= 5) ? 15.0 : 50.0;
+      prior_uncertainty_m = std::max(50.0, 0.5 * accel_uncertainty * dt * dt + cached->residual_m);
     } else {
       prior_uncertainty_m = std::max(100.0, 300.0 * dt + cached->residual_m);
     }
   }
   auto outcome = solve_group(corrected_group, position_prior, prior_uncertainty_m);
+  // Retry: if a 2-sensor solve failed, retry with halved uncertainty
+  // (stronger prior constraint) to pull the solver toward the correct
+  // basin.  This covers cases the in-solver multi-start misses because
+  // halved uncertainty yields a different base pw than the factor-scaled
+  // alternatives.
+  if (!outcome.result && n_sensors == 2 && position_prior && effective_alt_ft) {
+    double retry_uncertainty = prior_uncertainty_m * 0.5;
+    // Only retry when the halved uncertainty produces a meaningfully
+    // different prediction weight (at least 20% stronger than original).
+    double orig_pw = clamp(500.0 / std::max(prior_uncertainty_m, 1.0), 1.0, 12.0);
+    double retry_pw = clamp(500.0 / std::max(retry_uncertainty, 1.0), 1.0, 12.0);
+    if (retry_pw > orig_pw * 1.2) {
+      auto retry = solve_group(corrected_group, position_prior, retry_uncertainty);
+      if (retry.result) {
+        outcome = retry;
+      }
+    }
+  }
   if (outcome.result) {
     Vec3 aircraft_ecef = lla_to_ecef(outcome.result->lat, outcome.result->lon, ft_to_m(outcome.result->alt_ft));
     if (cached && msg_timestamp) {
