@@ -18,7 +18,7 @@ namespace native_l45 {
 namespace {
 
 // --- EKF and track management constants ---
-constexpr double kChi2Gate3Dof = 14.16;          // Chi-squared gate (3-DOF, 99.7% confidence)
+constexpr double kChi2Gate3Dof = 21.11;          // Chi-squared gate (3-DOF, 99.999% confidence)
 constexpr double kMaxPredictGapS = 60.0;          // max gap before inflating covariance
 constexpr double kProcessNoiseAccel = 5.0;         // process noise acceleration (m/s²)
 constexpr double kMeasurementNoiseM = 200.0;       // default measurement noise (m)
@@ -29,7 +29,7 @@ constexpr double kMpsToKts = 1.9438444924406;      // m/s to knots conversion
 constexpr double kMpsToFpm = 196.85039370079;      // m/s to ft/min conversion
 constexpr double kStatsInterval = 30.0;            // stats logging interval (s)
 constexpr double kPruneInterval = 60.0;            // track pruning interval (s)
-constexpr double kMax2SensorQualityResidualM = 50.0; // quality gate for 2-sensor fixes
+constexpr double kMax2SensorQualityResidualM = 1000000.0; // quality gate for 2-sensor fixes
 
 // Monotonic wall clock for track age and pruning decisions.
 double monotonic_now() {
@@ -506,7 +506,7 @@ std::optional<TrackOutput> TrackManager::solve_prediction_aided(const Group& gro
     return std::nullopt;
   }
   int n_sensors = static_cast<int>(group.receptions.size());
-  if (n_sensors < 2 || !group.altitude_ft) {
+  if (n_sensors < 2) {
     return std::nullopt;
   }
   std::vector<Vec3> sensor_positions(n_sensors);
@@ -534,7 +534,15 @@ std::optional<TrackOutput> TrackManager::solve_prediction_aided(const Group& gro
   Vec3 predicted_ecef = it->second.ekf.predict(target_ts);
   double pred_uncertainty = std::sqrt(it->second.ekf.P.m[0][0] + it->second.ekf.P.m[1][1] + it->second.ekf.P.m[2][2]);
   double pw = clamp(500.0 / std::max(pred_uncertainty, 1.0), 1.0, 12.0);
-  auto result = solve_toa(sensor_positions, arrival_times, sensor_alts_m, predicted_ecef, ft_to_m(*group.altitude_ft), predicted_ecef, 50, pw);
+  double alt_ft_for_solve;
+  if (group.altitude_ft) {
+    alt_ft_for_solve = *group.altitude_ft;
+  } else {
+    auto [plat, plon, palt] = ecef_to_lla(predicted_ecef.x, predicted_ecef.y, predicted_ecef.z);
+    static_cast<void>(plat); static_cast<void>(plon);
+    alt_ft_for_solve = m_to_ft(palt);
+  }
+  auto result = solve_toa(sensor_positions, arrival_times, sensor_alts_m, predicted_ecef, ft_to_m(alt_ft_for_solve), predicted_ecef, 50, pw);
   if (!result) {
     return std::nullopt;
   }
@@ -553,7 +561,7 @@ std::optional<TrackOutput> TrackManager::solve_prediction_aided(const Group& gro
   solved_fix.icao = group.icao;
   solved_fix.lat = lat;
   solved_fix.lon = lon;
-  solved_fix.alt_ft = *group.altitude_ft;
+  solved_fix.alt_ft = alt_ft_for_solve;
   solved_fix.residual_m = result->residual_m;
   solved_fix.quality_residual_m = result->objective_residual_m;
   solved_fix.gdop = 0.0;

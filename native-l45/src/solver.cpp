@@ -18,8 +18,8 @@ namespace {
 
 // --- Quality thresholds ---
 constexpr double kMaxRangeM = 500000.0;
-constexpr double kMaxGdop = 20.0;                   // 3D GDOP cap (>=4 sensors)
-constexpr double kMaxGdop2d = 10.0;                  // 2D GDOP cap (2-3 sensors)
+constexpr double kMaxGdop = 50.0;                   // 3D GDOP cap (>=4 sensors)
+constexpr double kMaxGdop2d = 25.0;                  // 2D GDOP cap (2-3 sensors)
 constexpr double kMaxResidualM = 10000.0;            // general residual cap
 constexpr double kMaxResidualPriorM = 200.0;         // residual cap for prior-aided solves
 constexpr double kMaxPriorDriftM = 30000.0;          // max drift from prior (3+ sensors)
@@ -203,7 +203,7 @@ struct AltitudeConstraintEval {
 AltitudeConstraintEval evaluate_altitude_constraint(const Vec3& x, double aircraft_alt_m, bool with_gradient) {
   auto [lat, lon, alt] = ecef_to_lla(x.x, x.y, x.z);
   AltitudeConstraintEval eval;
-  eval.residual = (alt - aircraft_alt_m) * 10.0;
+  eval.residual = (alt - aircraft_alt_m) * 3.0;
   if (!with_gradient) {
     return eval;
   }
@@ -211,9 +211,9 @@ AltitudeConstraintEval evaluate_altitude_constraint(const Vec3& x, double aircra
   double lon_r = lon * M_PI / 180.0;
   double cos_lat = std::cos(lat_r);
   eval.gradient = {
-      10.0 * cos_lat * std::cos(lon_r),
-      10.0 * cos_lat * std::sin(lon_r),
-      10.0 * std::sin(lat_r),
+      3.0 * cos_lat * std::cos(lon_r),
+      3.0 * cos_lat * std::sin(lon_r),
+      3.0 * std::sin(lat_r),
   };
   return eval;
 }
@@ -853,6 +853,21 @@ SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position
       return outcome;
     }
   }
+  // Compute GDOP early for adaptive threshold scaling
+  double gdop = 0.0;
+  if (n_used >= 4) {
+    gdop = compute_gdop(position, used_sensors);
+    if (gdop > kMaxGdop) {
+      outcome.fail_reason = "gdop_exceeded";
+      return outcome;
+    }
+  } else if (n_used >= 2 && altitude_m) {
+    gdop = compute_gdop_2d(position, used_sensors);
+    if (n_used >= 3 && gdop > kMaxGdop2d) {
+      outcome.fail_reason = "gdop_2d_exceeded";
+      return outcome;
+    }
+  }
   double effective_max_residual = kMaxResidualM;
   if (n_sensors == 2 && position_prior_ecef) {
     effective_max_residual = kMaxResidualPriorM;
@@ -871,20 +886,6 @@ SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position
     double max_prior_drift = base_drift * drift_scale;
     if (prior_offset_m > max_prior_drift) {
       outcome.fail_reason = "prior_drift_exceeded";
-      return outcome;
-    }
-  }
-  double gdop = 0.0;
-  if (n_used >= 4) {
-    gdop = compute_gdop(position, used_sensors);
-    if (gdop > kMaxGdop) {
-      outcome.fail_reason = "gdop_exceeded";
-      return outcome;
-    }
-  } else if (n_used >= 2 && altitude_m) {
-    gdop = compute_gdop_2d(position, used_sensors);
-    if (n_used >= 3 && gdop > kMaxGdop2d) {
-      outcome.fail_reason = "gdop_2d_exceeded";
       return outcome;
     }
   }
