@@ -460,11 +460,12 @@ class Layer4Stats {
 class Layer4Processor {
  public:
   Layer4Processor();
-  bool process_line(const std::string& line, std::ostream& out);
+  bool process_line(const std::string& line, std::ostream& out, bool defer_no_prior = false);
+  void process_deferred(std::ostream& out);
   void finish(std::ostream& log) const;
 
  private:
-  void process_group(Group group, std::ostream& out);
+  void process_group(Group group, std::ostream& out, const std::string* defer_line = nullptr);
 
   Layer4Stats stats_;
   ClockCalibrator clock_cal_;
@@ -474,6 +475,9 @@ class Layer4Processor {
   int cpr_seeds_ = 0;
   int df17_alt_extracted_ = 0;
   int cached_alt_used_ = 0;
+  std::vector<std::string> deferred_lines_;
+  int second_pass_solved_ = 0;
+  int second_pass_total_ = 0;
 };
 
 int run_layer4(std::istream& in, std::ostream& out, std::ostream& log);

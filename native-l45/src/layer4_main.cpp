@@ -6,8 +6,10 @@
 #include <iostream>
 
 int main() {
-  std::ios::sync_with_stdio(false);  // faster I/O (no sync with C stdio)
-  std::cin.tie(nullptr);             // untie cin from cout for throughput
+  std::ios::sync_with_stdio(false);
+  std::cin.tie(nullptr);
+  static char out_buf[1 << 16];
+  std::cout.rdbuf()->pubsetbuf(out_buf, sizeof(out_buf));
   try {
     return native_l45::run_layer4(std::cin, std::cout, std::cerr);
   } catch (const std::exception& ex) {

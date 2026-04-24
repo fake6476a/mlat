@@ -67,6 +67,7 @@ target_include_directories(native_l45_layer5 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/
 target_compile_options(native_l45_common PRIVATE
   -O3
   -march=native
+  -fno-math-errno
   -Wall
   -Wextra
   -Wpedantic
@@ -76,6 +77,7 @@ target_compile_options(native_l45_common PRIVATE
 target_compile_options(native_l45_layer4 PRIVATE
   -O3
   -march=native
+  -fno-math-errno
   -Wall
   -Wextra
   -Wpedantic
@@ -85,6 +87,7 @@ target_compile_options(native_l45_layer4 PRIVATE
 target_compile_options(native_l45_layer5 PRIVATE
   -O3
   -march=native
+  -fno-math-errno
   -Wall
   -Wextra
   -Wpedantic

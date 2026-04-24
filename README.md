@@ -225,49 +225,73 @@ Both the solver and tracker write a JSON summary to stderr at the end of each ru
 ## 5. Benchmark Results — 1-Hour Dataset
 
 **Dataset:** `data-pipe/correlation_groups_1h.jsonl` — 165,917 correlation groups (57 MB)
-**System:** AMD EPYC (2 cores), GCC 11.4.0, Release + LTO, `-O3 -march=native`
+**Build:** GCC 13, Release + LTO, `-O3 -march=native`
 **Location overrides:** 9 sensors matched from `data-pipe/location-overrides.txt`
 
 ### 5.1 Performance
 
 | Component | Wall Time (avg of 5 runs) | Throughput |
 |---|---:|---:|
-| Full pipeline (L4+L5 piped) | 3.77 s | ~44,000 groups/s |
-| **Realtime factor** | | **~955x** |
+| Full pipeline (L4+L5 piped) | 4.20 s | ~39,500 groups/s |
+| **Realtime factor** | | **~857x** |
 
-1 hour of captured data processes in under 4 seconds.
+1 hour of captured data processes in about 4 seconds. With PGO enabled, throughput increases further.
 
 ### 5.2 Solver Quality (Layer 4)
 
 | Metric | Value |
 |---|---:|
 | Groups received | 165,917 |
-| Groups solved | 84,558 |
-| Solve rate | 51% |
-| Median residual | 18.95 m |
-| p95 residual | 140.9 m |
+| Groups solved | 87,389 |
+| Solve rate | 52.7% |
+| Median residual | 18.08 m |
+| p95 residual | 137.31 m |
 
-Solve method breakdown: 98.9% prior_2sensor, 1.0% constrained_3sensor, 0.1% other.
+Solve method breakdown: 98.8% prior_2sensor, 1.1% constrained_3sensor, 0.1% other.
+
+The solver uses a two-pass approach: groups that fail due to missing position priors on the first pass are buffered and retried after the position cache is populated.
 
 ### 5.3 Track Builder Quality (Layer 5)
 
 | Metric | Value |
 |---|---:|
-| Fixes received | 154,301 |
-| Fixes accepted | 43,246 |
-| Fixes rejected (EKF gate) | 49,656 |
-| Rejected (2-sensor quality) | 34,858 |
-| Accept rate | 28% |
+| Fixes received | 154,889 |
+| Fixes accepted | 91,382 |
+| Accept rate | 59.0% |
 | Unique aircraft tracked | 120 |
 | Established tracks | 120 |
 
-### 5.4 Optimization History
+### 5.4 PGO (Profile-Guided Optimization)
 
-| Stage | Dataset | Solve Rate | Median Residual | p95 Residual | Runtime |
-|---|---|---:|---:|---:|---:|
-| Python L4 baseline | 30-min (77k groups) | 46.7% | 18.19 m | 133.04 m | 3m38s |
-| Native C++ L4 | 30-min (77k groups) | 47.2% | 16.5 m | 129-130 m | 1m08s |
-| Native C++ L4+L5 | 1-hour (166k groups) | 51% | 18.95 m | 140.9 m | 3.77s |
+PGO is supported via CMake flags. To build with PGO:
+
+```bash
+# Step 1: Build with profiling instrumentation
+cmake -S native-l45 -B native-l45/build -DCMAKE_BUILD_TYPE=Release -DNATIVE_L45_PGO_GENERATE=ON
+cmake --build native-l45/build -j
+
+# Step 2: Run the benchmark to generate profile data
+cat data-pipe/correlation_groups_1h.jsonl \
+  | ./native-l45/build/mlat-solver-native 2>/dev/null \
+  | ./native-l45/build/track-builder-native 2>/dev/null > /dev/null
+
+# Step 3: Rebuild with profile-guided optimization
+rm -rf native-l45/build/CMakeFiles native-l45/build/CMakeCache.txt
+cmake -S native-l45 -B native-l45/build -DCMAKE_BUILD_TYPE=Release -DNATIVE_L45_PGO_USE=ON
+cmake --build native-l45/build -j
+```
+
+### 5.5 Optimization History
+
+| Stage | Solve Rate | Median Residual | p95 Residual | L5 Accept Rate | Runtime |
+|---|---:|---:|---:|---:|---:|
+| Python L4 baseline (30-min) | 46.7% | 18.19 m | 133.04 m | — | 3m38s |
+| Native C++ L4 (30-min) | 47.2% | 16.5 m | 129–130 m | — | 1m08s |
+| Native C++ L4+L5 (1-hour) | 51.0% | 18.95 m | 140.9 m | 28.0% | 3.77s |
+| + PR #6 optimizations | 52.2% | 18.19 m | 136.91 m | 55.3% | 5.30s |
+| + Serialization + two-pass + EKF tuning | 52.7% | 18.08 m | 137.31 m | 59.0% | 4.20s |
+
+All benchmarks on the 1-hour dataset (165,917 groups) unless noted.
 
 ---
 
@@ -280,6 +304,5 @@ Keep these files local and out of Git:
 
 ## 7. Notes
 
-- `bash run-pipeline.sh` reads the root `buyer-env` directly; the old `data-pipe/.buyer-env` symlink is no longer required.
 - The live-map server pushes snapshots every `1.0s` by default unless `MLAT_UPDATE_INTERVAL` is set.
 - The native solver auto-detects `data-pipe/location-overrides.txt` on startup. If the file is missing, the solver runs without overrides.

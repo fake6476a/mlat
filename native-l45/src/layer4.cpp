@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <cstring>
 #include <sstream>
 
 namespace native_l45 {
@@ -65,18 +66,18 @@ std::string cpr_stats_json(const CPRBuffer& buffer) {
 
 Layer4Processor::Layer4Processor() : override_map_(load_location_overrides()) {}
 
-bool Layer4Processor::process_line(const std::string& line, std::ostream& out) {
+bool Layer4Processor::process_line(const std::string& line, std::ostream& out, bool defer_no_prior) {
   Group group;
   if (!parse_group_json(line, group)) {
     ++stats_.parse_errors;
     return false;
   }
   ++stats_.groups_received;
-  process_group(std::move(group), out);
+  process_group(std::move(group), out, defer_no_prior ? &line : nullptr);
   return true;
 }
 
-void Layer4Processor::process_group(Group group, std::ostream& out) {
+void Layer4Processor::process_group(Group group, std::ostream& out, const std::string* defer_line) {
   double now = monotonic_now();
   auto receptions = group.receptions;
   if (override_map_ && !override_map_->empty()) {
@@ -170,7 +171,11 @@ void Layer4Processor::process_group(Group group, std::ostream& out) {
   }
   if (n_sensors == 2 && effective_alt_ft) {
     if (!position_prior) {
-      out << to_json_unsolved_group(group) << '\n';
+      if (defer_line) {
+        deferred_lines_.push_back(*defer_line);
+      } else {
+        out << to_json_unsolved_group(group) << '\n';
+      }
       ++stats_.groups_skipped_sensors;
       ++stats_.failure_reasons["no_prior_2sensor"];
       return;
@@ -263,10 +268,33 @@ void Layer4Processor::finish(std::ostream& log) const {
   if (override_map_) {
     log << ",\"location_overrides\":" << override_map_->stats_json();
   }
+  if (second_pass_total_ > 0) {
+    log << ",\"second_pass\":{\"deferred\":" << second_pass_total_
+        << ",\"solved\":" << second_pass_solved_ << "}";
+  }
   log << "}\n";
   log << "Clock calibration: " << clock_cal_.calibrated_pairs << " valid pairings\n";
   log << "Position cache: " << pos_cache_.size() << " aircraft tracked\n";
   log << "CPR cache seeds: " << cpr_seeds_ << " (global=" << cpr_buffer_.global_decodes << ", local=" << cpr_buffer_.local_decodes << ")\n";
+  if (second_pass_total_ > 0) {
+    log << "Second pass: " << second_pass_solved_ << " / " << second_pass_total_ << " deferred groups solved\n";
+  }
+}
+
+void Layer4Processor::process_deferred(std::ostream& out) {
+  second_pass_total_ = static_cast<int>(deferred_lines_.size());
+  for (const auto& line : deferred_lines_) {
+    Group group;
+    if (!parse_group_json(line, group)) {
+      continue;
+    }
+    int old_solved = stats_.groups_solved;
+    process_group(std::move(group), out);
+    if (stats_.groups_solved > old_solved) {
+      ++second_pass_solved_;
+    }
+  }
+  deferred_lines_.clear();
 }
 
 int run_layer4(std::istream& in, std::ostream& out, std::ostream& log) {
@@ -276,8 +304,9 @@ int run_layer4(std::istream& in, std::ostream& out, std::ostream& log) {
     if (line.empty()) {
       continue;
     }
-    processor.process_line(line, out);
+    processor.process_line(line, out, true);
   }
+  processor.process_deferred(out);
   processor.finish(log);
   return 0;
 }

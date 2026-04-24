@@ -18,7 +18,7 @@ namespace native_l45 {
 namespace {
 
 // --- EKF and track management constants ---
-constexpr double kChi2Gate3Dof = 21.11;          // Chi-squared gate (3-DOF, 99.999% confidence)
+constexpr double kChi2Gate3Dof = 25.0;          // Chi-squared gate (3-DOF, 99.999% confidence)
 constexpr double kMaxPredictGapS = 60.0;          // max gap before inflating covariance
 constexpr double kProcessNoiseAccel = 5.0;         // process noise acceleration (m/s²)
 constexpr double kMeasurementNoiseM = 200.0;       // default measurement noise (m)
@@ -467,9 +467,9 @@ std::optional<TrackOutput> TrackManager::process_fix(const SolveFix& fix) {
   double ts = static_cast<double>(fix.timestamp_s) + static_cast<double>(fix.timestamp_ns) * 1e-9;
   std::optional<double> meas_noise;
   if (fix.num_sensors == 2 && fix.gdop > 0.0) {
-    meas_noise = std::min(3000.0, std::max(500.0, fix.quality_residual_m * fix.gdop * 3.0));
+    meas_noise = std::min(5000.0, std::max(700.0, fix.quality_residual_m * fix.gdop * 4.5));
   } else if (fix.num_sensors == 2) {
-    meas_noise = std::min(3000.0, std::max(500.0, fix.quality_residual_m * 8.0));
+    meas_noise = std::min(5000.0, std::max(700.0, fix.quality_residual_m * 12.0));
   } else if (fix.quality_residual_m > 0.0 && fix.gdop > 0.0) {
     meas_noise = std::min(2000.0, std::max(50.0, fix.quality_residual_m * fix.gdop));
   } else if (fix.quality_residual_m > 0.0) {
@@ -546,12 +546,12 @@ std::optional<TrackOutput> TrackManager::solve_prediction_aided(const Group& gro
   if (!result) {
     return std::nullopt;
   }
-  double max_residual = std::min(500.0, std::max(100.0, pred_uncertainty * 0.5));
+  double max_residual = std::min(800.0, std::max(150.0, pred_uncertainty * 0.8));
   if (result->residual_m > max_residual) {
     return std::nullopt;
   }
   double pred_offset = norm(result->position - predicted_ecef);
-  double max_offset = std::min(5000.0, std::max(500.0, pred_uncertainty * 3.0));
+  double max_offset = std::min(8000.0, std::max(500.0, pred_uncertainty * 4.0));
   if (pred_offset > max_offset) {
     return std::nullopt;
   }
