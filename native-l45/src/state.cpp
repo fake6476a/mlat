@@ -16,7 +16,7 @@ namespace {
 
 // --- Configuration constants ---
 constexpr double kOverrideMatchThresholdDeg = 0.5;  // max distance to match override to sensor
-constexpr double kMaxCacheAge = 120.0;             // max age of cached position (s)
+constexpr double kMaxCacheAge = 300.0;             // max age of cached position (s)
 constexpr std::size_t kMaxCacheSize = 5000;         // max cached aircraft before pruning
 constexpr double kMaxAircraftSpeedMps = 1030.0;     // physical consistency speed limit (m/s)
 constexpr double kMaxAircraftAccelMps2 = 50.0;      // physical consistency accel limit (m/s²)
