@@ -7,6 +7,7 @@
 #include <charconv>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstddef>
 #include <iomanip>
 #include <sstream>
@@ -383,50 +384,55 @@ std::string format_double(double value) {
   if (!std::isfinite(value)) {
     return "null";
   }
-  std::ostringstream os;
-  os << std::setprecision(15) << value;
-  return os.str();
+  char buf[32];
+  int n = std::snprintf(buf, sizeof(buf), "%.15g", value);
+  return std::string(buf, n);
 }
+
+std::string squawk_json(const std::optional<std::string>& squawk);
 
 // Serialise a Group to a JSON object string.
 std::string group_json_object(const Group& group) {
-  std::ostringstream os;
-  os << '{';
-  os << "\"icao\":";
-  append_json_string(os, group.icao);
-  os << ",\"df_type\":" << group.df_type;
-  os << ",\"altitude_ft\":";
+  std::string s;
+  s.reserve(512);
+  s += "{\"icao\":\"";
+  s += json_escape(group.icao);
+  s += "\",\"df_type\":";
+  s += std::to_string(group.df_type);
+  s += ",\"altitude_ft\":";
   if (group.altitude_ft) {
-    os << format_double(*group.altitude_ft);
+    s += format_double(*group.altitude_ft);
   } else {
-    os << "null";
+    s += "null";
   }
-  os << ",\"squawk\":";
-  if (group.squawk) {
-    append_json_string(os, *group.squawk);
-  } else {
-    os << "null";
-  }
-  os << ",\"raw_msg\":";
-  append_json_string(os, group.raw_msg);
-  os << ",\"num_sensors\":" << group.num_sensors;
-  os << ",\"receptions\":[";
+  s += ",\"squawk\":";
+  s += squawk_json(group.squawk);
+  s += ",\"raw_msg\":\"";
+  s += json_escape(group.raw_msg);
+  s += "\",\"num_sensors\":";
+  s += std::to_string(group.num_sensors);
+  s += ",\"receptions\":[";
   for (std::size_t i = 0; i < group.receptions.size(); ++i) {
     const auto& rec = group.receptions[i];
     if (i > 0) {
-      os << ',';
+      s += ',';
     }
-    os << '{';
-    os << "\"sensor_id\":" << rec.sensor_id;
-    os << ",\"lat\":" << format_double(rec.lat);
-    os << ",\"lon\":" << format_double(rec.lon);
-    os << ",\"alt\":" << format_double(rec.alt);
-    os << ",\"timestamp_s\":" << rec.timestamp_s;
-    os << ",\"timestamp_ns\":" << rec.timestamp_ns;
-    os << '}';
+    s += "{\"sensor_id\":";
+    s += std::to_string(rec.sensor_id);
+    s += ",\"lat\":";
+    s += format_double(rec.lat);
+    s += ",\"lon\":";
+    s += format_double(rec.lon);
+    s += ",\"alt\":";
+    s += format_double(rec.alt);
+    s += ",\"timestamp_s\":";
+    s += std::to_string(rec.timestamp_s);
+    s += ",\"timestamp_ns\":";
+    s += std::to_string(rec.timestamp_ns);
+    s += '}';
   }
-  os << "]}";
-  return os.str();
+  s += "]}";
+  return s;
 }
 
 std::string squawk_json(const std::optional<std::string>& squawk) {
@@ -766,60 +772,97 @@ std::string to_json_unsolved_group(const Group& group) {
 
 // Serialise a SolveFix to JSONL.
 std::string to_json_fix(const SolveFix& fix) {
-  std::ostringstream os;
-  os << '{';
-  os << "\"icao\":";
-  append_json_string(os, fix.icao);
-  os << ",\"lat\":" << format_double(fix.lat);
-  os << ",\"lon\":" << format_double(fix.lon);
-  os << ",\"alt_ft\":" << format_double(fix.alt_ft);
-  os << ",\"residual_m\":" << format_double(round_to(fix.residual_m, 2));
-  os << ",\"quality_residual_m\":" << format_double(round_to(fix.quality_residual_m, 2));
-  os << ",\"gdop\":" << format_double(round_to(fix.gdop, 2));
-  os << ",\"num_sensors\":" << fix.num_sensors;
-  os << ",\"solve_method\":";
-  append_json_string(os, fix.solve_method);
-  os << ",\"timestamp_s\":" << fix.timestamp_s;
-  os << ",\"timestamp_ns\":" << fix.timestamp_ns;
-  os << ",\"df_type\":" << fix.df_type;
-  os << ",\"squawk\":" << squawk_json(fix.squawk);
-  os << ",\"raw_msg\":";
-  append_json_string(os, fix.raw_msg);
-  os << ",\"t0_s\":" << format_double(round_to(fix.t0_s, 9));
-  os << '}';
-  return os.str();
+  std::string s;
+  s.reserve(512);
+  s += "{\"icao\":\"";
+  s += json_escape(fix.icao);
+  s += "\",\"lat\":";
+  s += format_double(fix.lat);
+  s += ",\"lon\":";
+  s += format_double(fix.lon);
+  s += ",\"alt_ft\":";
+  s += format_double(fix.alt_ft);
+  s += ",\"residual_m\":";
+  s += format_double(round_to(fix.residual_m, 2));
+  s += ",\"quality_residual_m\":";
+  s += format_double(round_to(fix.quality_residual_m, 2));
+  s += ",\"gdop\":";
+  s += format_double(round_to(fix.gdop, 2));
+  s += ",\"num_sensors\":";
+  s += std::to_string(fix.num_sensors);
+  s += ",\"solve_method\":\"";
+  s += json_escape(fix.solve_method);
+  s += "\",\"timestamp_s\":";
+  s += std::to_string(fix.timestamp_s);
+  s += ",\"timestamp_ns\":";
+  s += std::to_string(fix.timestamp_ns);
+  s += ",\"df_type\":";
+  s += std::to_string(fix.df_type);
+  s += ",\"squawk\":";
+  s += squawk_json(fix.squawk);
+  s += ",\"raw_msg\":\"";
+  s += json_escape(fix.raw_msg);
+  s += "\",\"t0_s\":";
+  s += format_double(round_to(fix.t0_s, 9));
+  s += '}';
+  return s;
 }
 
 // Serialise a TrackOutput to JSONL.
 std::string to_json_track(const TrackOutput& track) {
-  std::ostringstream os;
-  os << '{';
-  os << "\"icao\":";
-  append_json_string(os, track.icao);
-  os << ",\"lat\":" << format_double(round_to(track.lat, 6));
-  os << ",\"lon\":" << format_double(round_to(track.lon, 6));
-  os << ",\"alt_ft\":" << format_double(round_to(track.alt_ft, 0));
-  os << ",\"heading_deg\":" << format_double(round_to(track.heading_deg, 1));
-  os << ",\"speed_kts\":" << format_double(round_to(track.speed_kts, 1));
-  os << ",\"vrate_fpm\":" << format_double(round_to(track.vrate_fpm, 0));
-  os << ",\"track_quality\":" << track.track_quality;
-  os << ",\"positions_count\":" << track.positions_count;
-  os << ",\"residual_m\":" << format_double(track.residual_m);
-  os << ",\"quality_residual_m\":" << format_double(track.quality_residual_m);
-  os << ",\"gdop\":" << format_double(track.gdop);
-  os << ",\"num_sensors\":" << track.num_sensors;
-  os << ",\"solve_method\":";
-  append_json_string(os, track.solve_method);
-  os << ",\"timestamp_s\":" << track.timestamp_s;
-  os << ",\"timestamp_ns\":" << track.timestamp_ns;
-  os << ",\"df_type\":" << track.df_type;
-  os << ",\"squawk\":" << squawk_json(track.squawk);
-  os << ",\"raw_msg\":";
-  append_json_string(os, track.raw_msg);
-  os << ",\"t0_s\":" << format_double(track.t0_s);
-  os << ",\"cov_matrix\":[[" << format_double(track.cov_matrix[0][0]) << ',' << format_double(track.cov_matrix[0][1]) << "],[" << format_double(track.cov_matrix[1][0]) << ',' << format_double(track.cov_matrix[1][1]) << "]]";
-  os << '}';
-  return os.str();
+  std::string s;
+  s.reserve(600);
+  s += "{\"icao\":\"";
+  s += json_escape(track.icao);
+  s += "\",\"lat\":";
+  s += format_double(round_to(track.lat, 6));
+  s += ",\"lon\":";
+  s += format_double(round_to(track.lon, 6));
+  s += ",\"alt_ft\":";
+  s += format_double(round_to(track.alt_ft, 0));
+  s += ",\"heading_deg\":";
+  s += format_double(round_to(track.heading_deg, 1));
+  s += ",\"speed_kts\":";
+  s += format_double(round_to(track.speed_kts, 1));
+  s += ",\"vrate_fpm\":";
+  s += format_double(round_to(track.vrate_fpm, 0));
+  s += ",\"track_quality\":";
+  s += std::to_string(track.track_quality);
+  s += ",\"positions_count\":";
+  s += std::to_string(track.positions_count);
+  s += ",\"residual_m\":";
+  s += format_double(track.residual_m);
+  s += ",\"quality_residual_m\":";
+  s += format_double(track.quality_residual_m);
+  s += ",\"gdop\":";
+  s += format_double(track.gdop);
+  s += ",\"num_sensors\":";
+  s += std::to_string(track.num_sensors);
+  s += ",\"solve_method\":\"";
+  s += json_escape(track.solve_method);
+  s += "\",\"timestamp_s\":";
+  s += std::to_string(track.timestamp_s);
+  s += ",\"timestamp_ns\":";
+  s += std::to_string(track.timestamp_ns);
+  s += ",\"df_type\":";
+  s += std::to_string(track.df_type);
+  s += ",\"squawk\":";
+  s += squawk_json(track.squawk);
+  s += ",\"raw_msg\":\"";
+  s += json_escape(track.raw_msg);
+  s += "\",\"t0_s\":";
+  s += format_double(track.t0_s);
+  s += ",\"cov_matrix\":[[";
+  s += format_double(track.cov_matrix[0][0]);
+  s += ',';
+  s += format_double(track.cov_matrix[0][1]);
+  s += "],[";
+  s += format_double(track.cov_matrix[1][0]);
+  s += ',';
+  s += format_double(track.cov_matrix[1][1]);
+  s += "]]";
+  s += '}';
+  return s;
 }
 
 // Escape a string for JSON output (handles control chars, quotes, backslashes).
