@@ -5,32 +5,42 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MLAT Live Map — Aircraft Multilateration</title>
 
-    <!-- MapLibre GL JS v5.20.2 (BSD-3-Clause) -->
+    <!-- MapLibre GL JS (BSD-3-Clause) -->
     <link href="https://unpkg.com/maplibre-gl@5.20.2/dist/maplibre-gl.css" rel="stylesheet" />
     <script src="https://unpkg.com/maplibre-gl@5.20.2/dist/maplibre-gl.js"></script>
 
-    <!-- Deck.gl v9.2.11 (MIT) — standalone bundle -->
+    <!-- Deck.gl (MIT) — standalone bundle -->
     <script src="https://unpkg.com/deck.gl@9.2.11/dist.min.js"></script>
 
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
 
+        :root {
+            --panel-bg: rgba(10, 10, 26, 0.92);
+            --panel-border: rgba(0, 180, 255, 0.3);
+            --accent: #00b4ff;
+            --accent-dim: #8899aa;
+            --text: #e0e0e0;
+            --emergency: #ff4444;
+            --emergency-bg: rgba(255, 68, 68, 0.15);
+        }
+
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: #0a0a1a;
-            color: #e0e0e0;
+            color: var(--text);
             overflow: hidden;
         }
 
         #map { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
 
-        /* Status panel (top-left) */
+        /* ── Status panel (top-left) ── */
         .status-panel {
             position: absolute;
             top: 12px;
             left: 12px;
-            background: rgba(10, 10, 26, 0.92);
-            border: 1px solid rgba(0, 180, 255, 0.3);
+            background: var(--panel-bg);
+            border: 1px solid var(--panel-border);
             border-radius: 8px;
             padding: 12px 16px;
             min-width: 220px;
@@ -41,7 +51,7 @@
         .status-panel h1 {
             font-size: 14px;
             font-weight: 700;
-            color: #00b4ff;
+            color: var(--accent);
             margin-bottom: 8px;
             letter-spacing: 0.5px;
         }
@@ -53,8 +63,8 @@
             padding: 2px 0;
         }
 
-        .status-label { color: #8899aa; }
-        .status-value { color: #e0e0e0; font-weight: 600; }
+        .status-label { color: var(--accent-dim); }
+        .status-value { color: var(--text); font-weight: 600; }
 
         .ws-status {
             display: inline-block;
@@ -69,10 +79,35 @@
         .ws-disconnected { background: #ff4444; box-shadow: 0 0 6px #ff4444; }
         .ws-connecting { background: #ffaa00; box-shadow: 0 0 6px #ffaa00; }
 
-        /* Aircraft info tooltip */
+        /* ── Stats bar ── */
+        .stats-bar {
+            display: flex;
+            gap: 8px;
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid rgba(255,255,255,0.1);
+            flex-wrap: wrap;
+        }
+
+        .stat-item {
+            font-size: 10px;
+            text-align: center;
+        }
+
+        .stat-item .stat-val {
+            font-size: 12px;
+            font-weight: 700;
+            color: var(--accent);
+        }
+
+        .stat-item .stat-lbl {
+            color: var(--accent-dim);
+        }
+
+        /* ── Tooltip ── */
         .aircraft-tooltip {
             position: absolute;
-            background: rgba(10, 10, 26, 0.95);
+            background: var(--panel-bg);
             border: 1px solid rgba(0, 180, 255, 0.4);
             border-radius: 6px;
             padding: 10px 14px;
@@ -80,58 +115,435 @@
             pointer-events: none;
             z-index: 20;
             min-width: 180px;
+            max-width: 280px;
             backdrop-filter: blur(8px);
             display: none;
         }
 
-        .aircraft-tooltip .tt-icao {
+        .tt-icao {
             font-size: 14px;
             font-weight: 700;
-            color: #00b4ff;
+            color: var(--accent);
             margin-bottom: 4px;
         }
 
-        .aircraft-tooltip .tt-row {
+        .tt-row {
             display: flex;
             justify-content: space-between;
             padding: 1px 0;
         }
 
-        .aircraft-tooltip .tt-label { color: #8899aa; }
-        .aircraft-tooltip .tt-value { color: #e0e0e0; font-weight: 600; }
+        .tt-label { color: var(--accent-dim); }
+        .tt-value { color: var(--text); font-weight: 600; }
 
-        /* Legend */
-        .legend-panel {
+        .emergency-badge {
+            display: inline-block;
+            background: var(--emergency);
+            color: white;
+            font-size: 10px;
+            font-weight: 700;
+            padding: 1px 6px;
+            border-radius: 3px;
+            margin-left: 6px;
+            animation: pulse 1s ease-in-out infinite;
+        }
+
+        .emergency-text { color: var(--emergency) !important; font-weight: 700; }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        /* ── Detail Panel (click-to-select) ── */
+        .detail-panel {
+            position: absolute;
+            top: 12px;
+            right: 60px;
+            background: var(--panel-bg);
+            border: 1px solid var(--panel-border);
+            border-radius: 8px;
+            padding: 14px 18px;
+            min-width: 240px;
+            z-index: 15;
+            backdrop-filter: blur(8px);
+            display: none;
+        }
+
+        .detail-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+
+        .detail-header h2 {
+            font-size: 18px;
+            color: var(--accent);
+            font-family: monospace;
+            margin: 0;
+        }
+
+        .detail-close {
+            margin-left: auto;
+            background: none;
+            border: none;
+            color: var(--accent-dim);
+            font-size: 16px;
+            cursor: pointer;
+            padding: 2px 6px;
+        }
+
+        .detail-close:hover { color: white; }
+
+        .detail-row {
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+            padding: 2px 0;
+        }
+
+        .detail-label { color: var(--accent-dim); }
+        .detail-value { color: var(--text); font-weight: 600; }
+        .detail-divider {
+            border: none;
+            border-top: 1px solid rgba(255,255,255,0.1);
+            margin: 6px 0;
+        }
+
+        .detail-emergency {
+            background: var(--emergency);
+            color: white;
+            font-size: 11px;
+            font-weight: 700;
+            padding: 2px 8px;
+            border-radius: 4px;
+            animation: pulse 1s ease-in-out infinite;
+        }
+
+        /* ── Controls panel (layer toggles + altitude filter) ── */
+        .controls-panel {
             position: absolute;
             bottom: 32px;
             left: 12px;
-            background: rgba(10, 10, 26, 0.92);
-            border: 1px solid rgba(0, 180, 255, 0.3);
+            background: var(--panel-bg);
+            border: 1px solid var(--panel-border);
             border-radius: 8px;
             padding: 10px 14px;
             z-index: 10;
             backdrop-filter: blur(8px);
             font-size: 11px;
+            min-width: 200px;
         }
 
-        .legend-panel h3 {
+        .controls-panel h3 {
             font-size: 11px;
-            color: #00b4ff;
+            color: var(--accent);
             margin-bottom: 6px;
             font-weight: 600;
         }
 
-        .legend-item {
+        .toggle-row {
             display: flex;
             align-items: center;
             gap: 6px;
             padding: 2px 0;
         }
 
+        .toggle-row input[type="checkbox"] {
+            accent-color: var(--accent);
+            cursor: pointer;
+        }
+
+        .toggle-row label {
+            cursor: pointer;
+            color: var(--text);
+        }
+
+        .section-divider {
+            border: none;
+            border-top: 1px solid rgba(255,255,255,0.1);
+            margin: 6px 0;
+        }
+
+        /* ── Altitude filter ── */
+        .alt-filter {
+            margin-top: 4px;
+        }
+
+        .alt-filter .slider-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 10px;
+        }
+
+        .alt-filter input[type="range"] {
+            width: 80px;
+            accent-color: var(--accent);
+        }
+
+        .alt-filter .alt-val {
+            font-weight: 600;
+            color: var(--accent);
+            min-width: 30px;
+            text-align: right;
+        }
+
+        /* ── Legend ── */
+        .legend-section {
+            margin-top: 6px;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 1px 0;
+        }
+
         .legend-color {
             width: 12px;
             height: 12px;
             border-radius: 2px;
+        }
+
+        /* ── GDOP Legend ── */
+        .gdop-legend {
+            margin-top: 4px;
+        }
+
+        .gdop-legend .legend-item .legend-color {
+            border-radius: 50%;
+        }
+
+        /* ── Playback controls ── */
+        .playback-panel {
+            position: absolute;
+            bottom: 12px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--panel-bg);
+            border: 1px solid var(--panel-border);
+            border-radius: 8px;
+            padding: 8px 16px;
+            z-index: 15;
+            backdrop-filter: blur(8px);
+            display: none;
+            min-width: 360px;
+        }
+
+        .playback-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 12px;
+        }
+
+        .playback-btn {
+            background: rgba(0, 180, 255, 0.2);
+            border: 1px solid var(--accent);
+            color: var(--accent);
+            border-radius: 4px;
+            padding: 4px 10px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        .playback-btn:hover {
+            background: rgba(0, 180, 255, 0.4);
+        }
+
+        #seek-slider {
+            flex: 1;
+            accent-color: var(--accent);
+        }
+
+        .playback-label {
+            color: var(--accent-dim);
+            font-size: 10px;
+            white-space: nowrap;
+        }
+
+        #speed-select {
+            background: rgba(10, 10, 26, 0.9);
+            color: var(--text);
+            border: 1px solid var(--panel-border);
+            border-radius: 4px;
+            padding: 2px 4px;
+            font-size: 11px;
+        }
+
+        /* ── Aircraft sidebar ── */
+        .sidebar-toggle {
+            position: absolute;
+            top: 50%;
+            right: 0;
+            transform: translateY(-50%);
+            background: var(--panel-bg);
+            border: 1px solid var(--panel-border);
+            border-right: none;
+            border-radius: 8px 0 0 8px;
+            color: var(--accent);
+            padding: 8px 6px;
+            cursor: pointer;
+            z-index: 12;
+            font-size: 14px;
+        }
+
+        .sidebar-toggle:hover { background: rgba(0, 180, 255, 0.2); }
+
+        .aircraft-sidebar {
+            position: absolute;
+            top: 0;
+            right: -320px;
+            width: 320px;
+            height: 100%;
+            background: var(--panel-bg);
+            border-left: 1px solid var(--panel-border);
+            backdrop-filter: blur(8px);
+            z-index: 11;
+            transition: right 0.3s ease;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .aircraft-sidebar.open {
+            right: 0;
+        }
+
+        .sidebar-header {
+            padding: 12px;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+
+        .sidebar-header h2 {
+            font-size: 14px;
+            color: var(--accent);
+            margin-bottom: 8px;
+        }
+
+        #aircraft-search {
+            width: 100%;
+            background: rgba(255,255,255,0.05);
+            border: 1px solid var(--panel-border);
+            border-radius: 4px;
+            color: var(--text);
+            padding: 6px 10px;
+            font-size: 12px;
+            outline: none;
+        }
+
+        #aircraft-search:focus {
+            border-color: var(--accent);
+        }
+
+        #aircraft-search::placeholder {
+            color: var(--accent-dim);
+        }
+
+        .sidebar-table-wrapper {
+            flex: 1;
+            overflow-y: auto;
+        }
+
+        .sidebar-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 11px;
+        }
+
+        .sidebar-table th {
+            position: sticky;
+            top: 0;
+            background: rgba(10, 10, 26, 0.98);
+            color: var(--accent);
+            text-align: left;
+            padding: 6px 6px;
+            font-weight: 600;
+            cursor: pointer;
+            white-space: nowrap;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+
+        .sidebar-table th:hover { color: white; }
+
+        .sidebar-table td {
+            padding: 4px 6px;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+            white-space: nowrap;
+        }
+
+        .sidebar-table tr {
+            cursor: pointer;
+        }
+
+        .sidebar-table tr:hover {
+            background: rgba(0, 180, 255, 0.1);
+        }
+
+        .selected-row {
+            background: rgba(0, 180, 255, 0.2) !important;
+        }
+
+        .emergency-row {
+            background: var(--emergency-bg) !important;
+            animation: pulse 2s ease-in-out infinite;
+        }
+
+        /* ── Scrollbar ── */
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(0, 180, 255, 0.3); border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(0, 180, 255, 0.5); }
+
+        /* ── Responsive ── */
+        @media (max-width: 768px) {
+            .status-panel {
+                top: 8px;
+                left: 8px;
+                min-width: 180px;
+                padding: 8px 12px;
+            }
+            .status-panel h1 { font-size: 12px; }
+            .status-row { font-size: 10px; }
+            .stats-bar { display: none; }
+
+            .controls-panel {
+                bottom: 8px;
+                left: 8px;
+                min-width: 160px;
+                padding: 8px 10px;
+                max-height: 40vh;
+                overflow-y: auto;
+            }
+
+            .detail-panel {
+                top: auto;
+                bottom: 60px;
+                right: 8px;
+                left: 8px;
+                min-width: auto;
+            }
+
+            .aircraft-sidebar {
+                width: 100%;
+                right: -100%;
+            }
+
+            .playback-panel {
+                min-width: auto;
+                left: 8px;
+                right: 8px;
+                transform: none;
+            }
+
+            .playback-row { flex-wrap: wrap; }
+        }
+
+        @media (max-width: 480px) {
+            .controls-panel .legend-section { display: none; }
+            .alt-filter { display: none; }
         }
     </style>
 </head>
@@ -146,7 +558,7 @@
                 <span class="ws-status ws-connecting" id="ws-indicator"></span>
                 WebSocket
             </span>
-            <span class="status-value" id="ws-state">Connecting…</span>
+            <span class="status-value" id="ws-state">Connecting&hellip;</span>
         </div>
         <div class="status-row">
             <span class="status-label">Aircraft</span>
@@ -158,381 +570,154 @@
         </div>
         <div class="status-row">
             <span class="status-label">Last Update</span>
-            <span class="status-value" id="last-update">—</span>
+            <span class="status-value" id="last-update">&mdash;</span>
+        </div>
+        <div class="stats-bar">
+            <div class="stat-item">
+                <div class="stat-val" id="stat-msg-sec">0/s</div>
+                <div class="stat-lbl">Msg Rate</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-val" id="stat-med-res">0 m</div>
+                <div class="stat-lbl">Med Res</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-val" id="stat-p95-res">0 m</div>
+                <div class="stat-lbl">P95 Res</div>
+            </div>
         </div>
     </div>
 
-    <!-- Aircraft tooltip -->
-    <div class="aircraft-tooltip" id="tooltip">
-        <div class="tt-icao" id="tt-icao"></div>
-        <div class="tt-row"><span class="tt-label">Altitude</span><span class="tt-value" id="tt-alt"></span></div>
-        <div class="tt-row"><span class="tt-label">Speed</span><span class="tt-value" id="tt-speed"></span></div>
-        <div class="tt-row"><span class="tt-label">Heading</span><span class="tt-value" id="tt-heading"></span></div>
-        <div class="tt-row"><span class="tt-label">V/Rate</span><span class="tt-value" id="tt-vrate"></span></div>
-        <div class="tt-row"><span class="tt-label">Sensors</span><span class="tt-value" id="tt-sensors"></span></div>
-        <div class="tt-row"><span class="tt-label">GDOP</span><span class="tt-value" id="tt-gdop"></span></div>
-        <div class="tt-row"><span class="tt-label">Residual</span><span class="tt-value" id="tt-residual"></span></div>
-        <div class="tt-row"><span class="tt-label">Quality</span><span class="tt-value" id="tt-quality"></span></div>
-        <div class="tt-row"><span class="tt-label">Method</span><span class="tt-value" id="tt-method"></span></div>
+    <!-- Tooltip -->
+    <div class="aircraft-tooltip" id="tooltip"></div>
+
+    <!-- Detail panel (click-to-select) -->
+    <div class="detail-panel" id="detail-panel"></div>
+
+    <!-- Controls panel (layer toggles + altitude filter + legend) -->
+    <div class="controls-panel">
+        <h3>LAYERS</h3>
+        <div class="toggle-row">
+            <input type="checkbox" class="layer-toggle" data-layer="trails" id="toggle-trails" checked>
+            <label for="toggle-trails">Flight Trails</label>
+        </div>
+        <div class="toggle-row">
+            <input type="checkbox" class="layer-toggle" data-layer="ellipses" id="toggle-ellipses" checked>
+            <label for="toggle-ellipses">Uncertainty Ellipses</label>
+        </div>
+        <div class="toggle-row">
+            <input type="checkbox" class="layer-toggle" data-layer="sensors" id="toggle-sensors" checked>
+            <label for="toggle-sensors">Sensors</label>
+        </div>
+        <div class="toggle-row">
+            <input type="checkbox" class="layer-toggle" data-layer="labels" id="toggle-labels" checked>
+            <label for="toggle-labels">ICAO Labels</label>
+        </div>
+        <div class="toggle-row">
+            <input type="checkbox" class="layer-toggle" data-layer="gdop" id="toggle-gdop">
+            <label for="toggle-gdop">GDOP Overlay</label>
+        </div>
+
+        <hr class="section-divider">
+
+        <h3>ALTITUDE FILTER (ft)</h3>
+        <div class="alt-filter">
+            <div class="slider-row">
+                <span class="alt-val" id="alt-min-val">0</span>
+                <input type="range" id="alt-min" min="0" max="60000" step="1000" value="0">
+                <span style="color:var(--accent-dim)">Min</span>
+            </div>
+            <div class="slider-row">
+                <span class="alt-val" id="alt-max-val">60k</span>
+                <input type="range" id="alt-max" min="0" max="60000" step="1000" value="60000">
+                <span style="color:var(--accent-dim)">Max</span>
+            </div>
+        </div>
+
+        <hr class="section-divider">
+
+        <div class="legend-section">
+            <h3>ALTITUDE</h3>
+            <div class="legend-item"><div class="legend-color" style="background:#00ff88"></div> &lt; 10,000 ft</div>
+            <div class="legend-item"><div class="legend-color" style="background:#00ccff"></div> 10k&ndash;25k ft</div>
+            <div class="legend-item"><div class="legend-color" style="background:#aa66ff"></div> 25k&ndash;35k ft</div>
+            <div class="legend-item"><div class="legend-color" style="background:#ff6644"></div> &gt; 35,000 ft</div>
+        </div>
+
+        <div class="gdop-legend" style="display:none" id="gdop-legend">
+            <h3>GDOP QUALITY</h3>
+            <div class="legend-item"><div class="legend-color" style="background:#00c800"></div> Excellent (&lt;5)</div>
+            <div class="legend-item"><div class="legend-color" style="background:#ffff00"></div> Good (5&ndash;10)</div>
+            <div class="legend-item"><div class="legend-color" style="background:#ff8c00"></div> Fair (10&ndash;20)</div>
+            <div class="legend-item"><div class="legend-color" style="background:#ff0000"></div> Poor (&gt;20)</div>
+        </div>
     </div>
 
-    <!-- Altitude legend -->
-    <div class="legend-panel">
-        <h3>ALTITUDE (ft)</h3>
-        <div class="legend-item"><div class="legend-color" style="background:#00ff88"></div> &lt; 10,000</div>
-        <div class="legend-item"><div class="legend-color" style="background:#00ccff"></div> 10,000–25,000</div>
-        <div class="legend-item"><div class="legend-color" style="background:#aa66ff"></div> 25,000–35,000</div>
-        <div class="legend-item"><div class="legend-color" style="background:#ff6644"></div> &gt; 35,000</div>
+    <!-- Playback controls (replay mode only) -->
+    <div class="playback-panel" id="playback-panel">
+        <div class="playback-row">
+            <button class="playback-btn" id="restart-btn" title="Restart">&#x23EE;</button>
+            <button class="playback-btn" id="play-pause-btn" title="Play/Pause">&#x23F8;</button>
+            <input type="range" id="seek-slider" min="0" max="100" value="0">
+            <select id="speed-select">
+                <option value="0.5">0.5x</option>
+                <option value="1" selected>1x</option>
+                <option value="2">2x</option>
+                <option value="5">5x</option>
+                <option value="10">10x</option>
+                <option value="20">20x</option>
+                <option value="50">50x</option>
+            </select>
+            <span class="playback-label" id="replay-progress">0%</span>
+        </div>
     </div>
 
+    <!-- Sidebar toggle button -->
+    <button class="sidebar-toggle" id="sidebar-toggle" title="Open aircraft list">&laquo;</button>
+
+    <!-- Aircraft list sidebar -->
+    <div class="aircraft-sidebar" id="aircraft-sidebar">
+        <div class="sidebar-header">
+            <h2>AIRCRAFT LIST</h2>
+            <input type="text" id="aircraft-search" placeholder="Search ICAO / Squawk..."
+                   oninput="window.__searchAircraft && window.__searchAircraft()">
+        </div>
+        <div class="sidebar-table-wrapper">
+            <table class="sidebar-table">
+                <thead>
+                    <tr>
+                        <th class="sort-btn" data-sort="icao">ICAO</th>
+                        <th class="sort-btn" data-sort="squawk">SQK</th>
+                        <th class="sort-btn" data-sort="alt_ft">ALT</th>
+                        <th class="sort-btn" data-sort="speed_kts">SPD</th>
+                        <th class="sort-btn" data-sort="heading_deg">HDG</th>
+                        <th class="sort-btn" data-sort="track_quality">QTY</th>
+                    </tr>
+                </thead>
+                <tbody id="aircraft-tbody"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- GDOP legend visibility toggle script -->
     <script>
-    // ── Configuration ──────────────────────────────────────────────
-    const WS_URL = `ws://${window.location.host}/ws`;
-    const CORNWALL_CENTER = [-5.05, 50.27];  // Cornwall, UK
-    const INITIAL_ZOOM = 8;
-
-    // ── State ──────────────────────────────────────────────────────
-    let aircraftData = [];
-    let trailData = [];
-    let updateCount = 0;
-    let ws = null;
-    let reconnectTimer = null;
-
-    // ── Color by altitude ──────────────────────────────────────────
-    function altitudeColor(altFt) {
-        if (altFt == null) return [128, 128, 128, 220];
-        if (altFt < 10000)  return [0, 255, 136, 220];   // green
-        if (altFt < 25000)  return [0, 204, 255, 220];   // cyan
-        if (altFt < 35000)  return [170, 102, 255, 220]; // purple
-        return [255, 102, 68, 220];                       // orange
-    }
-
-    // ── MapLibre GL JS initialization ──────────────────────────────
-    const map = new maplibregl.Map({
-        container: 'map',
-        style: {
-            version: 8,
-            name: 'MLAT Dark',
-            sources: {
-                'osm-tiles': {
-                    type: 'raster',
-                    tiles: [
-                        'https://tile.openstreetmap.org/{z}/{x}/{y}.png'
-                    ],
-                    tileSize: 256,
-                    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
-                }
-            },
-            layers: [
-                {
-                    id: 'osm-layer',
-                    type: 'raster',
-                    source: 'osm-tiles',
-                    paint: {
-                        'raster-saturation': -0.8,
-                        'raster-brightness-max': 0.4,
-                        'raster-contrast': 0.3
-                    }
-                }
-            ]
-        },
-        center: CORNWALL_CENTER,
-        zoom: INITIAL_ZOOM,
-        pitch: 0,
-        bearing: 0
-    });
-
-    map.addControl(new maplibregl.NavigationControl(), 'top-right');
-    map.addControl(new maplibregl.ScaleControl({ maxWidth: 200 }), 'bottom-right');
-
-    // ── Deck.gl overlay ────────────────────────────────────────────
-    let deckOverlay = null;
-
-    function createDeckOverlay() {
-        deckOverlay = new deck.MapboxOverlay({
-            interleaved: false,
-            layers: buildLayers()
+        // Show/hide GDOP legend when toggle changes
+        document.getElementById('toggle-gdop').addEventListener('change', function() {
+            document.getElementById('gdop-legend').style.display = this.checked ? 'block' : 'none';
         });
-        map.addControl(deckOverlay);
-    }
-    function computeEllipseVertices(center, covMatrix, segments=32) {
-        if (!covMatrix) return [];
-        const [lon, lat] = center;
-        const Pxx = covMatrix[0][0];
-        const Pxy = covMatrix[0][1];
-        const Pyy = covMatrix[1][1];
 
-        const trace = Pxx + Pyy;
-        const det = Pxx * Pyy - Pxy * Pxy;
-        const lambda1 = (trace + Math.sqrt(Math.max(0, trace * trace - 4 * det))) / 2;
-        const lambda2 = (trace - Math.sqrt(Math.max(0, trace * trace - 4 * det))) / 2;
-
-        const theta = 0.5 * Math.atan2(2 * Pxy, Pxx - Pyy);
-        const scale1 = 3.03 * Math.sqrt(Math.max(0, lambda1));
-        const scale2 = 3.03 * Math.sqrt(Math.max(0, lambda2));
-
-        const metersPerDegLat = 111320;
-        const metersPerDegLon = 40075000 * Math.cos(lat * Math.PI / 180) / 360;
-
-        const vertices = [];
-        for (let i = 0; i < segments; i++) {
-            const angle = (i * 2 * Math.PI) / segments;
-            const x = scale1 * Math.cos(angle);
-            const y = scale2 * Math.sin(angle);
-
-            const dx = x * Math.cos(theta) - y * Math.sin(theta);
-            const dy = x * Math.sin(theta) + y * Math.cos(theta);
-
-            vertices.push([
-                lon + dx / metersPerDegLon,
-                lat + dy / metersPerDegLat
-            ]);
-        }
-        return vertices;
-    }
-
-    function buildLayers() {
-        const layers = [];
-
-        // Trail layer — PathLayer for flight trails
-        if (trailData.length > 0) {
-            layers.push(new deck.PathLayer({
-                id: 'trails',
-                data: trailData,
-                getPath: d => d.path,
-                getColor: d => {
-                    const c = altitudeColor(d.alt_ft);
-                    return [c[0], c[1], c[2], 80]; // semi-transparent
-                },
-                getWidth: 2,
-                widthMinPixels: 1,
-                widthMaxPixels: 3,
-                capRounded: true,
-                jointRounded: true,
-                pickable: false,
-            }));
-        }
-
-        // Aircraft icon layer and uncertainty ellipses
-        if (aircraftData.length > 0) {
-            layers.push(new deck.PolygonLayer({
-                id: 'uncertainty-ellipses',
-                data: aircraftData.filter(d => d.cov_matrix && d.cov_matrix[0][0] < 1e5),
-                getPolygon: d => computeEllipseVertices([d.lon, d.lat], d.cov_matrix),
-                getFillColor: [255, 60, 60, 40],
-                getLineColor: [255, 60, 60, 150],
-                lineWidthMinPixels: 1,
-                stroked: true,
-                filled: true,
-                pickable: false,
-            }));
-
-            layers.push(new deck.ScatterplotLayer({
-                id: 'aircraft',
-                data: aircraftData,
-                getPosition: d => [d.lon, d.lat],
-                getRadius: 6,
-                radiusMinPixels: 4,
-                radiusMaxPixels: 12,
-                getFillColor: d => altitudeColor(d.alt_ft),
-                getLineColor: [255, 255, 255, 180],
-                lineWidthMinPixels: 1,
-                stroked: true,
-                pickable: true,
-                autoHighlight: true,
-                highlightColor: [255, 255, 255, 100],
-            }));
-
-            // Text labels for ICAO addresses
-            layers.push(new deck.TextLayer({
-                id: 'labels',
-                data: aircraftData,
-                getPosition: d => [d.lon, d.lat],
-                getText: d => d.icao,
-                getSize: 11,
-                getColor: [255, 255, 255, 200],
-                getAngle: 0,
-                getTextAnchor: 'start',
-                getAlignmentBaseline: 'bottom',
-                getPixelOffset: [10, -10],
-                fontFamily: 'monospace',
-                fontWeight: 700,
-                pickable: false,
-            }));
-        }
-
-        // Sensor positions — fixed markers for the 9 Cornwall sensors
-        const sensorLayer = new deck.ScatterplotLayer({
-            id: 'sensors',
-            data: [
-                // Approximate Cornwall sensor positions (from reference doc)
-                { lon: -5.7, lat: 50.1, name: 'Sensor 1' },
-                { lon: -5.6, lat: 50.2, name: 'Sensor 2' },
-                { lon: -5.5, lat: 50.3, name: 'Sensor 3' },
-                { lon: -5.4, lat: 50.15, name: 'Sensor 4' },
-                { lon: -5.3, lat: 50.25, name: 'Sensor 5' },
-                { lon: -5.1, lat: 50.35, name: 'Sensor 6' },
-                { lon: -5.0, lat: 50.1, name: 'Sensor 7' },
-                { lon: -6.3, lat: 49.92, name: 'Sensor 8' },
-                { lon: -6.35, lat: 49.95, name: 'Sensor 9' },
-            ],
-            getPosition: d => [d.lon, d.lat],
-            getRadius: 5,
-            radiusMinPixels: 3,
-            radiusMaxPixels: 8,
-            getFillColor: [255, 200, 0, 200],
-            getLineColor: [255, 255, 255, 200],
-            lineWidthMinPixels: 1,
-            stroked: true,
-            pickable: false,
-        });
-        layers.push(sensorLayer);
-
-        return layers;
-    }
-
-    // ── Tooltip handling ───────────────────────────────────────────
-    const tooltip = document.getElementById('tooltip');
-
-    function showTooltip(info) {
-        if (!info || !info.object) {
-            tooltip.style.display = 'none';
-            return;
-        }
-
-        const d = info.object;
-        document.getElementById('tt-icao').textContent = d.icao || '—';
-        document.getElementById('tt-alt').textContent = d.alt_ft != null ? `${Math.round(d.alt_ft).toLocaleString()} ft` : '—';
-        document.getElementById('tt-speed').textContent = d.speed_kts != null ? `${Math.round(d.speed_kts)} kts` : '—';
-        document.getElementById('tt-heading').textContent = d.heading_deg != null ? `${Math.round(d.heading_deg)}°` : '—';
-        document.getElementById('tt-vrate').textContent = d.vrate_fpm != null ? `${Math.round(d.vrate_fpm)} fpm` : '—';
-        document.getElementById('tt-sensors').textContent = d.num_sensors || '—';
-        document.getElementById('tt-gdop').textContent = d.gdop != null ? d.gdop.toFixed(1) : '—';
-        document.getElementById('tt-residual').textContent = d.residual_m != null ? `${d.residual_m.toFixed(0)} m` : '—';
-        document.getElementById('tt-quality').textContent = d.track_quality || '—';
-        document.getElementById('tt-method').textContent = d.solve_method || '—';
-
-        tooltip.style.display = 'block';
-        tooltip.style.left = (info.x + 12) + 'px';
-        tooltip.style.top = (info.y + 12) + 'px';
-    }
-
-    // ── WebSocket connection ───────────────────────────────────────
-    function connectWebSocket() {
-        setWsStatus('connecting');
-
-        ws = new WebSocket(WS_URL);
-
-        ws.onopen = () => {
-            setWsStatus('connected');
-            if (reconnectTimer) {
-                clearTimeout(reconnectTimer);
-                reconnectTimer = null;
-            }
+        // Wire up search to sidebar update
+        window.__searchAircraft = () => {
+            // Trigger from the module — imported UI handles this via updateSidebar()
+            if (window.__triggerSidebarUpdate) window.__triggerSidebarUpdate();
         };
+    </script>
 
-        ws.onmessage = (event) => {
-            try {
-                const msg = JSON.parse(event.data);
-                if (msg.type === 'update') {
-                    handleUpdate(msg);
-                }
-            } catch (e) {
-                console.error('Parse error:', e);
-            }
-        };
-
-        ws.onclose = () => {
-            setWsStatus('disconnected');
-            scheduleReconnect();
-        };
-
-        ws.onerror = () => {
-            setWsStatus('disconnected');
-        };
-    }
-
-    function scheduleReconnect() {
-        if (!reconnectTimer) {
-            reconnectTimer = setTimeout(() => {
-                reconnectTimer = null;
-                connectWebSocket();
-            }, 3000);
-        }
-    }
-
-    function setWsStatus(state) {
-        const indicator = document.getElementById('ws-indicator');
-        const label = document.getElementById('ws-state');
-
-        indicator.className = 'ws-status';
-        switch (state) {
-            case 'connected':
-                indicator.classList.add('ws-connected');
-                label.textContent = 'Connected';
-                break;
-            case 'disconnected':
-                indicator.classList.add('ws-disconnected');
-                label.textContent = 'Disconnected';
-                break;
-            case 'connecting':
-                indicator.classList.add('ws-connecting');
-                label.textContent = 'Connecting…';
-                break;
-        }
-    }
-
-    // ── Handle data updates ────────────────────────────────────────
-    function handleUpdate(msg) {
-        updateCount++;
-        const aircraft = msg.aircraft || [];
-
-        // Update aircraft positions
-        aircraftData = aircraft.map(ac => ({
-            icao: ac.icao,
-            lat: ac.lat,
-            lon: ac.lon,
-            alt_ft: ac.alt_ft,
-            heading_deg: ac.heading_deg,
-            speed_kts: ac.speed_kts,
-            vrate_fpm: ac.vrate_fpm,
-            track_quality: ac.track_quality,
-            num_sensors: ac.num_sensors,
-            gdop: ac.gdop,
-            residual_m: ac.residual_m,
-            solve_method: ac.solve_method,
-            cov_matrix: ac.cov_matrix,
-        }));
-
-        // Update trail data
-        trailData = aircraft
-            .filter(ac => ac.trail && ac.trail.length >= 2)
-            .map(ac => ({
-                icao: ac.icao,
-                alt_ft: ac.alt_ft,
-                path: ac.trail,
-            }));
-
-        // Update UI stats
-        document.getElementById('aircraft-count').textContent = aircraft.length;
-        document.getElementById('update-count').textContent = updateCount;
-        document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
-
-        // Refresh Deck.gl layers
-        if (deckOverlay) {
-            deckOverlay.setProps({
-                layers: buildLayers(),
-                getTooltip: null,
-                onHover: showTooltip,
-            });
-        }
-    }
-
-    // ── Initialize ─────────────────────────────────────────────────
-    map.on('load', async () => {
-        createDeckOverlay();
-        connectWebSocket();
-    });
+    <!-- Main application (ES module) -->
+    <script type="module" src="/static/js/main.js"></script>
+    <script type="module">
+        import { updateSidebar } from '/static/js/ui.js';
+        window.__triggerSidebarUpdate = updateSidebar;
     </script>
 </body>
 </html>
