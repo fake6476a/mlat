@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cctype>
 #include <iostream>
 #include <cstring>
 #include <sstream>
@@ -43,6 +44,15 @@ int delegate_2sensor_min_solves() {
   return value;
 }
 
+std::string lower_env(std::string_view value) {
+  std::string out;
+  out.reserve(value.size());
+  for (char ch : value) {
+    out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+  }
+  return out;
+}
+
 std::optional<int> extract_df17_altitude(const std::string& raw_msg) {
   auto frame = extract_df17_position_fields(raw_msg);
   if (!frame || !frame->alt_ft) {
@@ -64,7 +74,46 @@ std::string cpr_stats_json(const CPRBuffer& buffer) {
 
 }  // namespace
 
-Layer4Processor::Layer4Processor() : override_map_(load_location_overrides()) {}
+Layer4Config layer4_config_from_env() {
+  Layer4Config config;
+  const char* env = std::getenv("MLAT_MODE");
+  if (env && *env) {
+    std::string mode = lower_env(env);
+    if (mode == "pure" || mode == "pure_mlat" || mode == "pure_challenge" || mode == "challenge") {
+      config.mode = MlatMode::PureChallenge;
+      config.min_sensors_with_alt = 3;
+      config.min_sensors_no_alt = 4;
+      config.allow_adsb_position_priors = false;
+      config.allow_adsb_clock_reference = false;
+      config.allow_2sensor_output = false;
+      config.allow_cached_altitude = false;
+      config.allow_adsb_velocity = false;
+    }
+  }
+  const char* min_with_alt = std::getenv("MLAT_MIN_SENSORS_WITH_ALT");
+  if (min_with_alt && *min_with_alt) {
+    char* end = nullptr;
+    long parsed = std::strtol(min_with_alt, &end, 10);
+    if (end != min_with_alt && (!end || *end == '\0') && parsed >= 2 && parsed <= 16) {
+      config.min_sensors_with_alt = static_cast<int>(parsed);
+    }
+  }
+  const char* min_no_alt = std::getenv("MLAT_MIN_SENSORS_NO_ALT");
+  if (min_no_alt && *min_no_alt) {
+    char* end = nullptr;
+    long parsed = std::strtol(min_no_alt, &end, 10);
+    if (end != min_no_alt && (!end || *end == '\0') && parsed >= 2 && parsed <= 16) {
+      config.min_sensors_no_alt = static_cast<int>(parsed);
+    }
+  }
+  if (config.mode == MlatMode::PureChallenge) {
+    config.min_sensors_with_alt = std::max(config.min_sensors_with_alt, 3);
+    config.min_sensors_no_alt = std::max(config.min_sensors_no_alt, 4);
+  }
+  return config;
+}
+
+Layer4Processor::Layer4Processor(Layer4Config config) : config_(config), override_map_(load_location_overrides()) {}
 
 bool Layer4Processor::process_line(const std::string& line, std::ostream& out, bool defer_no_prior) {
   Group group;
@@ -98,7 +147,7 @@ void Layer4Processor::process_group(Group group, std::ostream& out, const std::s
   if (!receptions.empty()) {
     msg_timestamp = static_cast<double>(receptions[0].timestamp_s) + static_cast<double>(receptions[0].timestamp_ns) * 1e-9;
   }
-  if (group.df_type == 17 && raw_msg.size() == 28) {
+  if (config_.allow_adsb_position_priors && group.df_type == 17 && raw_msg.size() == 28) {
     auto cpr_frame = extract_df17_position_fields(raw_msg);
     if (cpr_frame && msg_timestamp) {
       cpr_frame->timestamp = *msg_timestamp;
@@ -120,13 +169,15 @@ void Layer4Processor::process_group(Group group, std::ostream& out, const std::s
           decoded_ecef = position_to_ecef(decoded->lat, decoded->lon, std::nullopt);
           alt_m = 10000.0;
         }
-        pos_cache_.put(icao, decoded_ecef, decoded->lat, decoded->lon, *alt_m, *msg_timestamp, 0.0);
+        pos_cache_.put(icao, decoded_ecef, decoded->lat, decoded->lon, *alt_m, *msg_timestamp, 0.0, PositionSource::AdsbCpr);
         ++cpr_seeds_;
-        clock_cal_.process_adsb_reference(decoded_ecef, receptions, now);
+        if (config_.allow_adsb_clock_reference) {
+          clock_cal_.process_reference(decoded_ecef, receptions, now, "adsb_position");
+        }
       }
     }
   }
-  if (group.df_type == 17 && raw_msg.size() == 28 && msg_timestamp) {
+  if (config_.allow_adsb_velocity && group.df_type == 17 && raw_msg.size() == 28 && msg_timestamp) {
     auto velocity = extract_df17_velocity(raw_msg);
     if (velocity) {
       constexpr double kKtsToMps = 0.514444;
@@ -146,7 +197,7 @@ void Layer4Processor::process_group(Group group, std::ostream& out, const std::s
       ++df17_alt_extracted_;
     }
   }
-  if (!effective_alt_ft && msg_timestamp) {
+  if (config_.allow_cached_altitude && !effective_alt_ft && msg_timestamp) {
     auto cached = pos_cache_.get(icao, *msg_timestamp);
     if (cached) {
       effective_alt_ft = std::round(cached->alt_m / 0.3048);
@@ -166,8 +217,14 @@ void Layer4Processor::process_group(Group group, std::ostream& out, const std::s
   }
   std::optional<Vec3> position_prior;
   auto cached = (msg_timestamp ? pos_cache_.get(icao, *msg_timestamp) : std::optional<CachedPosition>{});
-  if (cached && msg_timestamp) {
+  bool prior_from_broadcast = cached && cached->source == PositionSource::AdsbCpr;
+  if (cached && msg_timestamp && (config_.allow_adsb_position_priors || !prior_from_broadcast)) {
     position_prior = cached->predict(*msg_timestamp);
+  }
+  if (!config_.allow_2sensor_output && n_sensors < config_.min_sensors_with_alt) {
+    ++stats_.groups_skipped_sensors;
+    ++stats_.failure_reasons["pure_mode_min_sensors"];
+    return;
   }
   if (n_sensors == 2 && effective_alt_ft) {
     if (!position_prior) {
@@ -210,7 +267,12 @@ void Layer4Processor::process_group(Group group, std::ostream& out, const std::s
       prior_uncertainty_m = std::max(100.0, 300.0 * dt + cached->residual_m);
     }
   }
-  auto outcome = solve_group(corrected_group, position_prior, prior_uncertainty_m);
+  SolverConfig solver_config;
+  solver_config.mode = config_.mode;
+  solver_config.min_sensors_with_alt = config_.min_sensors_with_alt;
+  solver_config.min_sensors_no_alt = config_.min_sensors_no_alt;
+  solver_config.allow_prior_aided = config_.allow_2sensor_output;
+  auto outcome = solve_group(corrected_group, position_prior, prior_uncertainty_m, solver_config);
   if (outcome.result) {
     Vec3 aircraft_ecef = lla_to_ecef(outcome.result->lat, outcome.result->lon, ft_to_m(outcome.result->alt_ft));
     if (cached && msg_timestamp) {
@@ -220,13 +282,28 @@ void Layer4Processor::process_group(Group group, std::ostream& out, const std::s
         return;
       }
     }
+    outcome.result->mlat_mode = mode_name(config_.mode);
+    outcome.result->uses_broadcast_position = prior_from_broadcast && position_prior.has_value();
+    outcome.result->uses_track_prior = false;
+    outcome.result->baro_altitude_used = effective_alt_ft.has_value();
+    bool used_clock_calibration = clock_cal_.has_any_calibration(receptions);
+    if (config_.mode == MlatMode::PureChallenge) {
+      outcome.result->position_source = "pure_tdoa";
+      outcome.result->clock_reference_source = used_clock_calibration ? "mlat_fix" : "none";
+    } else if (outcome.result->uses_broadcast_position) {
+      outcome.result->position_source = "hybrid_adsb_prior_tdoa";
+      outcome.result->clock_reference_source = used_clock_calibration ? "mixed" : "none";
+    } else {
+      outcome.result->position_source = "hybrid_tdoa";
+      outcome.result->clock_reference_source = used_clock_calibration ? "mixed" : "none";
+    }
     out << to_json_fix(*outcome.result) << '\n';
     stats_.record_solve(outcome.result->solve_method, outcome.result->residual_m);
     if (msg_timestamp) {
-      pos_cache_.put(icao, aircraft_ecef, outcome.result->lat, outcome.result->lon, ft_to_m(outcome.result->alt_ft), *msg_timestamp, outcome.result->residual_m);
+      pos_cache_.put(icao, aircraft_ecef, outcome.result->lat, outcome.result->lon, ft_to_m(outcome.result->alt_ft), *msg_timestamp, outcome.result->residual_m, PositionSource::PureMlat);
     }
-    if (outcome.result->quality_residual_m < 200.0 && clock_cal_.has_any_calibration(receptions)) {
-      clock_cal_.process_adsb_reference(aircraft_ecef, receptions, now);
+    if (outcome.result->quality_residual_m < 200.0 && (config_.mode == MlatMode::PureChallenge || clock_cal_.has_any_calibration(receptions))) {
+      clock_cal_.process_reference(aircraft_ecef, receptions, now, "mlat_fix");
     }
     for (const auto& rec : corrected_receptions) {
       double dt_s = static_cast<double>(rec.timestamp_s - outcome.result->timestamp_s);
@@ -259,6 +336,12 @@ void Layer4Processor::finish(std::ostream& log) const {
     base.pop_back();
   }
   log << "[stats] " << base;
+  log << ",\"mlat_mode\":\"" << mode_name(config_.mode) << '"';
+  log << ",\"min_sensors_with_alt\":" << config_.min_sensors_with_alt;
+  log << ",\"min_sensors_no_alt\":" << config_.min_sensors_no_alt;
+  log << ",\"allow_adsb_position_priors\":" << (config_.allow_adsb_position_priors ? "true" : "false");
+  log << ",\"allow_adsb_clock_reference\":" << (config_.allow_adsb_clock_reference ? "true" : "false");
+  log << ",\"allow_2sensor_output\":" << (config_.allow_2sensor_output ? "true" : "false");
   log << ",\"clock_cal\":" << clock_cal_.stats_json();
   log << ",\"pos_cache\":" << pos_cache_.stats_json();
   log << ",\"cpr_buffer\":" << cpr_stats_json(cpr_buffer_);

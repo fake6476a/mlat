@@ -209,7 +209,7 @@ std::optional<CachedPosition> PositionCache::get(const std::string& icao, std::o
 }
 
 // Store or update position for an ICAO. Derives velocity from consecutive solves.
-void PositionCache::put(const std::string& icao, const Vec3& ecef, double lat, double lon, double alt_m, double timestamp, double residual_m) {
+void PositionCache::put(const std::string& icao, const Vec3& ecef, double lat, double lon, double alt_m, double timestamp, double residual_m, PositionSource source) {
   std::optional<Vec3> velocity;
   int solve_count = 1;
   auto it = cache_.find(icao);
@@ -230,6 +230,7 @@ void PositionCache::put(const std::string& icao, const Vec3& ecef, double lat, d
   entry.residual_m = residual_m;
   entry.solve_count = solve_count;
   entry.last_order = static_cast<double>(++order_counter_);
+  entry.source = source;
   cache_[icao] = entry;
   if (cache_.size() > kMaxCacheSize) {
     prune();
@@ -292,6 +293,10 @@ std::string PositionCache::stats_json() const {
 
 std::size_t PositionCache::size() const {
   return cache_.size();
+}
+
+std::string mode_name(MlatMode mode) {
+  return mode == MlatMode::PureChallenge ? "pure_challenge" : "hybrid_ops";
 }
 
 // --- Clock Calibration ---
@@ -388,12 +393,17 @@ ClockPairing& ClockCalibrator::get_pairing(std::int64_t a, std::int64_t b) {
   return it->second;
 }
 
-// Train clock calibration from an ADS-B reference: compute range-corrected
+// Train clock calibration from a reference: compute range-corrected
 // arrival times, then update pairwise Kalman filters for all sensor pairs.
-void ClockCalibrator::process_adsb_reference(const Vec3& aircraft_ecef, const std::vector<Reception>& receptions, double now) {
+void ClockCalibrator::process_reference(const Vec3& aircraft_ecef, const std::vector<Reception>& receptions, double now, std::string_view source) {
   int n = static_cast<int>(receptions.size());
   if (n < 2) {
     return;
+  }
+  if (source == "adsb_position") {
+    ++adsb_reference_groups;
+  } else if (source == "mlat_fix") {
+    ++mlat_reference_groups;
   }
   std::vector<std::pair<std::int64_t, double>> corrected;
   corrected.reserve(receptions.size());
@@ -540,6 +550,8 @@ std::string ClockCalibrator::stats_json() const {
   os << ",\"sync_points_total\":" << sync_points_total;
   os << ",\"sync_points_accepted\":" << sync_points_accepted;
   os << ",\"groups_corrected\":" << groups_corrected;
+  os << ",\"adsb_reference_groups\":" << adsb_reference_groups;
+  os << ",\"mlat_reference_groups\":" << mlat_reference_groups;
   os << ",\"pair_details\":{";
   int emitted = 0;
   bool first = true;

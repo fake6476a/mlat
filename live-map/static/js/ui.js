@@ -254,6 +254,9 @@ export function showTooltip(info) {
             <div class="tt-row"><span class="tt-label">Residual</span><span class="tt-value">${d.residual_m != null ? d.residual_m.toFixed(0) + ' m' : '—'}</span></div>
             <div class="tt-row"><span class="tt-label">Quality</span><span class="tt-value">${d.track_quality || '—'}</span></div>
             <div class="tt-row"><span class="tt-label">Method</span><span class="tt-value">${d.solve_method || '—'}</span></div>
+            <div class="tt-row"><span class="tt-label">Mode</span><span class="tt-value">${d.mlat_mode || '—'}</span></div>
+            <div class="tt-row"><span class="tt-label">Source</span><span class="tt-value">${d.position_source || '—'}</span></div>
+            <div class="tt-row"><span class="tt-label">Broadcast pos</span><span class="tt-value">${d.uses_broadcast_position === true ? 'yes' : 'no'}</span></div>
         `;
     }
 
@@ -288,6 +291,9 @@ export function showDetailPanel(d) {
         <div class="detail-row"><span class="detail-label">Residual</span><span class="detail-value">${d.residual_m != null ? d.residual_m.toFixed(1) + ' m' : '—'}</span></div>
         <div class="detail-row"><span class="detail-label">Quality</span><span class="detail-value">${d.track_quality || '—'}</span></div>
         <div class="detail-row"><span class="detail-label">Method</span><span class="detail-value">${d.solve_method || '—'}</span></div>
+        <div class="detail-row"><span class="detail-label">MLAT Mode</span><span class="detail-value">${d.mlat_mode || '—'}</span></div>
+        <div class="detail-row"><span class="detail-label">Position Source</span><span class="detail-value">${d.position_source || '—'}</span></div>
+        <div class="detail-row"><span class="detail-label">Broadcast Position</span><span class="detail-value">${d.uses_broadcast_position === true ? 'yes' : 'no'}</span></div>
         <div class="detail-row"><span class="detail-label">Age</span><span class="detail-value">${d.age_s != null ? d.age_s.toFixed(0) + 's' : '—'}</span></div>
         <div class="detail-row"><span class="detail-label">Position</span><span class="detail-value">${d.lat != null ? d.lat.toFixed(5) + ', ' + d.lon.toFixed(5) : '—'}</span></div>
     `;

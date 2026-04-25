@@ -371,6 +371,24 @@ bool parse_fix_object(const JsonValue::Object& object, SolveFix& out) {
   out.squawk = json_get_string_optional(object, "squawk");
   out.raw_msg = *raw_msg;
   out.t0_s = *t0_s;
+  if (auto mlat_mode = json_get_string_optional(object, "mlat_mode")) {
+    out.mlat_mode = *mlat_mode;
+  }
+  if (auto position_source = json_get_string_optional(object, "position_source")) {
+    out.position_source = *position_source;
+  }
+  if (auto uses_broadcast_position = json_get_bool_optional(object, "uses_broadcast_position")) {
+    out.uses_broadcast_position = *uses_broadcast_position;
+  }
+  if (auto uses_track_prior = json_get_bool_optional(object, "uses_track_prior")) {
+    out.uses_track_prior = *uses_track_prior;
+  }
+  if (auto baro_altitude_used = json_get_bool_optional(object, "baro_altitude_used")) {
+    out.baro_altitude_used = *baro_altitude_used;
+  }
+  if (auto clock_reference_source = json_get_string_optional(object, "clock_reference_source")) {
+    out.clock_reference_source = *clock_reference_source;
+  }
   return true;
 }
 
@@ -804,6 +822,19 @@ std::string to_json_fix(const SolveFix& fix) {
   s += json_escape(fix.raw_msg);
   s += "\",\"t0_s\":";
   s += format_double(round_to(fix.t0_s, 9));
+  s += ",\"mlat_mode\":\"";
+  s += json_escape(fix.mlat_mode);
+  s += "\",\"position_source\":\"";
+  s += json_escape(fix.position_source);
+  s += "\",\"uses_broadcast_position\":";
+  s += fix.uses_broadcast_position ? "true" : "false";
+  s += ",\"uses_track_prior\":";
+  s += fix.uses_track_prior ? "true" : "false";
+  s += ",\"baro_altitude_used\":";
+  s += fix.baro_altitude_used ? "true" : "false";
+  s += ",\"clock_reference_source\":\"";
+  s += json_escape(fix.clock_reference_source);
+  s += '"';
   s += '}';
   return s;
 }
@@ -861,6 +892,19 @@ std::string to_json_track(const TrackOutput& track) {
   s += ',';
   s += format_double(track.cov_matrix[1][1]);
   s += "]]";
+  s += ",\"mlat_mode\":\"";
+  s += json_escape(track.mlat_mode);
+  s += "\",\"position_source\":\"";
+  s += json_escape(track.position_source);
+  s += "\",\"uses_broadcast_position\":";
+  s += track.uses_broadcast_position ? "true" : "false";
+  s += ",\"uses_track_prior\":";
+  s += track.uses_track_prior ? "true" : "false";
+  s += ",\"baro_altitude_used\":";
+  s += track.baro_altitude_used ? "true" : "false";
+  s += ",\"clock_reference_source\":\"";
+  s += json_escape(track.clock_reference_source);
+  s += '"';
   s += '}';
   return s;
 }
