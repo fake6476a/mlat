@@ -736,7 +736,7 @@ std::optional<ToaResult> solve_constrained_3sensor(
 
 // Top-level group solver: selects method based on sensor count and available priors,
 // runs the solver, applies quality checks (residual, GDOP, range, prior drift).
-SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position_prior_ecef, double prior_uncertainty_m) {
+SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position_prior_ecef, double prior_uncertainty_m, const SolverConfig& config) {
   SolveOutcome outcome;
   int n_sensors = static_cast<int>(group.receptions.size());
   if (n_sensors < 2) {
@@ -747,18 +747,19 @@ SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position
   if (group.altitude_ft) {
     altitude_m = ft_to_m(*group.altitude_ft);
   }
-  if (altitude_m && position_prior_ecef) {
+  std::optional<Vec3> effective_prior = config.allow_prior_aided ? position_prior_ecef : std::nullopt;
+  if (altitude_m && effective_prior) {
     if (n_sensors < kMinSensorsWithPrior) {
       outcome.fail_reason = "too_few_sensors";
       return outcome;
     }
   } else if (altitude_m) {
-    if (n_sensors < kMinSensorsWithAlt) {
+    if (n_sensors < config.min_sensors_with_alt) {
       outcome.fail_reason = "too_few_sensors";
       return outcome;
     }
   } else {
-    if (n_sensors < kMinSensorsNoAlt) {
+    if (n_sensors < config.min_sensors_no_alt) {
       outcome.fail_reason = "too_few_sensors";
       return outcome;
     }
@@ -785,12 +786,12 @@ SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position
     arrival_times[i] = static_cast<double>(dt_s) + static_cast<double>(dt_ns) * 1e-9;
   }
   int min_sensors_needed = 0;
-  if (altitude_m && position_prior_ecef) {
+  if (altitude_m && effective_prior) {
     min_sensors_needed = kMinSensorsWithPrior;
   } else if (altitude_m) {
-    min_sensors_needed = kMinSensorsWithAlt;
+    min_sensors_needed = config.min_sensors_with_alt;
   } else {
-    min_sensors_needed = kMinSensorsNoAlt;
+    min_sensors_needed = config.min_sensors_no_alt;
   }
   std::optional<ToaResult> result;
   std::string solve_method = "unknown";
@@ -799,7 +800,7 @@ SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position
   int n_used = n_sensors;
   if (n_sensors >= 4) {
     int outlier_min = std::max(3, min_sensors_needed);
-    auto outlier_result = solve_with_outlier_rejection(sensor_positions, arrival_times, sensor_alts_m, altitude_m, position_prior_ecef, outlier_min);
+    auto outlier_result = solve_with_outlier_rejection(sensor_positions, arrival_times, sensor_alts_m, altitude_m, effective_prior, outlier_min);
     result = outlier_result.result;
     solve_method = outlier_result.solve_method;
     used_sensors = outlier_result.used_sensors;
@@ -810,8 +811,8 @@ SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position
     }
   } else {
     std::optional<Vec3> x0;
-    if (position_prior_ecef) {
-      x0 = *position_prior_ecef;
+    if (effective_prior) {
+      x0 = *effective_prior;
       solve_method = "prior_aided";
     }
     if (!x0) {
@@ -819,8 +820,8 @@ SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position
       solve_method = "centroid_init";
      }
      double pw = n_sensors == 2 ? clamp(500.0 / std::max(prior_uncertainty_m, 1.0), 1.0, 12.0) : 3.0;
-     if (n_sensors == 2 && altitude_m && position_prior_ecef) {
-       result = solve_toa(sensor_positions, arrival_times, sensor_alts_m, *x0, altitude_m, position_prior_ecef, kPrior2SensorMaxNfev, pw);
+     if (n_sensors == 2 && altitude_m && effective_prior) {
+       result = solve_toa(sensor_positions, arrival_times, sensor_alts_m, *x0, altitude_m, effective_prior, kPrior2SensorMaxNfev, pw);
        if (result) {
          solve_method = "prior_2sensor";
        }
@@ -843,10 +844,10 @@ SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position
   Vec3 position = result->position;
   double residual_m = result->residual_m;
   double prior_offset_m = 0.0;
-  if (position_prior_ecef) {
-    prior_offset_m = norm(position - *position_prior_ecef);
+  if (effective_prior) {
+    prior_offset_m = norm(position - *effective_prior);
   }
-  double quality_residual_m = (n_sensors == 2 && position_prior_ecef) ? std::max(residual_m, prior_offset_m) : residual_m;
+  double quality_residual_m = (n_sensors == 2 && effective_prior) ? std::max(residual_m, prior_offset_m) : residual_m;
   for (const auto& sensor : used_sensors) {
     if (norm(position - sensor) > kMaxRangeM) {
       outcome.fail_reason = "range_exceeded";
@@ -869,7 +870,7 @@ SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position
     }
   }
   double effective_max_residual = kMaxResidualM;
-  if (n_sensors == 2 && position_prior_ecef) {
+  if (n_sensors == 2 && effective_prior) {
     effective_max_residual = kMaxResidualPriorM;
   } else if (n_used == 3 && altitude_m) {
     effective_max_residual = 2000.0;
@@ -880,7 +881,7 @@ SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position
     outcome.fail_reason = "residual_exceeded";
     return outcome;
   }
-  if (position_prior_ecef && n_sensors <= 3) {
+  if (effective_prior && n_sensors <= 3) {
     double base_drift = n_sensors == 2 ? kMaxPriorDrift2SensorM : kMaxPriorDriftM;
     double drift_scale = std::min(3.0, std::max(1.0, kMaxResidualPriorM / std::max(residual_m, 10.0)));
     double max_prior_drift = base_drift * drift_scale;
@@ -901,6 +902,23 @@ SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position
   fix.gdop = gdop;
   fix.num_sensors = n_used;
   fix.solve_method = solve_method;
+  if (config.mode == MlatMode::PureChallenge && solve_method == "constrained_3sensor") {
+    fix.solve_method = "pure_3sensor_baro";
+  } else if (config.mode == MlatMode::PureChallenge && solve_method.rfind("constrained_3sensor_drop", 0) == 0) {
+    fix.solve_method = "pure_3sensor_baro" + solve_method.substr(std::string("constrained_3sensor").size());
+  } else if (config.mode == MlatMode::PureChallenge && solve_method == "inamdar_4sensor_alt") {
+    fix.solve_method = "pure_4sensor_baro";
+  } else if (config.mode == MlatMode::PureChallenge && solve_method.rfind("inamdar_4sensor_alt_drop", 0) == 0) {
+    fix.solve_method = "pure_4sensor_baro" + solve_method.substr(std::string("inamdar_4sensor_alt").size());
+  } else if (config.mode == MlatMode::PureChallenge && solve_method == "inamdar_5sensor") {
+    fix.solve_method = "pure_5sensor";
+  } else if (config.mode == MlatMode::PureChallenge && solve_method.rfind("inamdar_5sensor_drop", 0) == 0) {
+    fix.solve_method = "pure_5sensor" + solve_method.substr(std::string("inamdar_5sensor").size());
+  } else if (config.mode == MlatMode::PureChallenge && solve_method == "frisch_toa") {
+    fix.solve_method = "pure_4plus_toa";
+  } else if (config.mode == MlatMode::PureChallenge && solve_method.rfind("frisch_toa_drop", 0) == 0) {
+    fix.solve_method = "pure_4plus_toa" + solve_method.substr(std::string("frisch_toa").size());
+  }
   fix.timestamp_s = ref_timestamp_s;
   fix.timestamp_ns = ref_timestamp_ns;
   fix.df_type = group.df_type;

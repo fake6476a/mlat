@@ -1,6 +1,11 @@
 # Native C++ MLAT Pipeline — Benchmarking & Usage
 
-A 6-layer multilateration pipeline that takes raw ADS-B sensor feeds and produces real-time aircraft tracks on a live map. Layers 4 and 5 are native C++ for maximum throughput.
+A 6-layer multilateration pipeline that takes raw Mode-S/ADS-B sensor feeds and produces real-time aircraft tracks on a live map. Layers 4 and 5 are native C++ for maximum throughput.
+
+The project now has two explicit operating modes:
+
+- **Challenge / pure MLAT mode** (`MLAT_MODE=pure_challenge`): uses receiver timing, receiver geometry, and Mode-S metadata such as ICAO/barometric altitude, but does **not** use ADS-B broadcast latitude/longitude as a position prior, clock reference, or output source. It disables 2-sensor position output and Layer 5 prediction-aided solves.
+- **Hybrid operations mode** (default): keeps ADS-B CPR position priors, ADS-B-derived clock references, 2-sensor prior-aided solves, and EKF prediction-aided solves for higher live-map continuity. Do not present hybrid metrics as “without broadcast location data.”
 
 ## Pipeline Architecture
 
@@ -21,7 +26,7 @@ Run every command in this README from the repository root.
 
 ```
                           ┌─────────────────────────────────────┐
-                          │        Raw ADS-B Sensor Feed        │
+                          │      Raw Mode-S/ADS-B Sensor Feed    │
                           └──────────────┬──────────────────────┘
                                          │
                           ┌──────────────▼──────────────────────┐
@@ -31,7 +36,7 @@ Run every command in this README from the repository root.
                                          │  stdout JSONL
                           ┌──────────────▼──────────────────────┐
                           │  Layer 2 — Python modes-decoder     │
-                          │  Decode ADS-B frames (DF17, etc.)   │
+                          │  Decode Mode-S/ADS-B frames         │
                           └──────────────┬──────────────────────┘
                                          │  stdout JSONL
                           ┌──────────────▼──────────────────────┐
@@ -184,7 +189,34 @@ cat data-pipe/correlation_groups_1h.jsonl \
 
 Output: `layer5_native_1h.jsonl` (EKF-filtered tracks), `tracker_native_1h.log` (JSON stats on stderr).
 
-### 4.3 Full replay through Layer 6 (live map)
+### 4.3 Challenge mode — pure MLAT replay
+
+Use this mode for hackathon claims that require aircraft localization **without relying on broadcast location data**:
+
+```bash
+cat data-pipe/correlation_groups_1h.jsonl \
+| MLAT_MODE=pure_challenge ./native-l45/build/mlat-solver-native 2>solver_pure_1h.log \
+| MLAT_MODE=pure_challenge ./native-l45/build/track-builder-native 2>tracker_pure_1h.log \
+> layer5_pure_1h.jsonl
+```
+
+Optional stricter setting: require 4+ receivers even when barometric altitude is available:
+
+```bash
+cat data-pipe/correlation_groups_1h.jsonl \
+| MLAT_MODE=pure_challenge MLAT_MIN_SENSORS_WITH_ALT=4 ./native-l45/build/mlat-solver-native 2>solver_pure4_1h.log \
+> layer4_pure4_1h.jsonl
+```
+
+Pure mode audit behavior:
+
+- `uses_broadcast_position` is always `false` for accepted pure fixes/tracks.
+- `position_source` is `pure_tdoa`.
+- `solve_method` is labelled with `pure_*` methods where applicable.
+- 2-sensor groups are not output as MLAT positions.
+- Layer 5 does not manufacture prediction-aided positions from unsolved groups.
+
+### 4.4 Full replay through Layer 6 (live map)
 
 ```bash
 cat data-pipe/correlation_groups_1h.jsonl \
@@ -195,7 +227,7 @@ cat data-pipe/correlation_groups_1h.jsonl \
 
 Open `http://127.0.0.1:8080`.
 
-### 4.4 Timed benchmark run (5 iterations)
+### 4.5 Timed benchmark run (5 iterations)
 
 ```bash
 for i in 1 2 3 4 5; do
@@ -207,7 +239,7 @@ for i in 1 2 3 4 5; do
 done
 ```
 
-### 4.5 Reading benchmark stats from logs
+### 4.6 Reading benchmark stats from logs
 
 Both the solver and tracker write a JSON summary to stderr at the end of each run. Key fields:
 
@@ -242,22 +274,24 @@ Both the solver and tracker write a JSON summary to stderr at the end of each ru
 | Metric | Value |
 |---|---:|
 | Groups received | 165,917 |
-| Groups solved | 87,389 |
-| Solve rate | 52.7% |
-| Median residual | 18.08 m |
-| p95 residual | 137.31 m |
+| Groups solved | 87,042 |
+| Solve rate | 52.5% |
+| Median residual | 21.83 m |
+| p95 residual | 137.14 m |
 
-Solve method breakdown: 98.8% prior_2sensor, 1.1% constrained_3sensor, 0.1% other.
+Solve method breakdown in default hybrid mode: 98.9% prior_2sensor, 1.1% constrained_3sensor, 0.1% other.
 
-The solver uses a two-pass approach: groups that fail due to missing position priors on the first pass are buffered and retried after the position cache is populated.
+The default benchmark is a hybrid operational tracker benchmark. It is useful for throughput and live-map continuity, but it is not the correct proof for a challenge that forbids reliance on broadcast aircraft position data.
+
+For challenge judging, run `MLAT_MODE=pure_challenge` and report those results separately. In the verified 1-hour replay, pure mode produced 620 L4 fixes and 227 accepted L5 tracks with `uses_broadcast_position=false` and `position_source=pure_tdoa` for every accepted record. Pure mode intentionally has lower solve rate on sparse captures because the 1-hour dataset is dominated by 2-sensor groups.
 
 ### 5.3 Track Builder Quality (Layer 5)
 
 | Metric | Value |
 |---|---:|
-| Fixes received | 154,889 |
-| Fixes accepted | 91,382 |
-| Accept rate | 59.0% |
+| Fixes received | 155,054 |
+| Fixes accepted | 91,377 |
+| Accept rate | 58.9% |
 | Unique aircraft tracked | 120 |
 | Established tracks | 120 |
 

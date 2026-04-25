@@ -9,6 +9,8 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <cctype>
 #include <iostream>
 #include <optional>
 #include <sstream>
@@ -35,6 +37,21 @@ constexpr double kMax2SensorQualityResidualM = 1000000.0; // quality gate for 2-
 double monotonic_now() {
   using clock = std::chrono::steady_clock;
   return std::chrono::duration<double>(clock::now().time_since_epoch()).count();
+}
+
+MlatMode track_mode_from_env() {
+  const char* env = std::getenv("MLAT_MODE");
+  if (!env || !*env) {
+    return MlatMode::HybridOps;
+  }
+  std::string value(env);
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+    return static_cast<char>(std::tolower(ch));
+  });
+  if (value == "pure" || value == "pure_mlat" || value == "pure_challenge" || value == "challenge") {
+    return MlatMode::PureChallenge;
+  }
+  return MlatMode::HybridOps;
 }
 
 // 3x3 matrix inversion with partial pivoting (for S^{-1} in EKF update).
@@ -448,8 +465,16 @@ TrackOutput TrackState::to_output(const SolveFix& fix) const {
   out.raw_msg = fix.raw_msg;
   out.t0_s = fix.t0_s;
   out.cov_matrix = {{{p_enu[0][0], p_enu[0][1]}, {p_enu[1][0], p_enu[1][1]}}};
+  out.mlat_mode = fix.mlat_mode;
+  out.position_source = fix.position_source;
+  out.uses_broadcast_position = fix.uses_broadcast_position;
+  out.uses_track_prior = fix.uses_track_prior;
+  out.baro_altitude_used = fix.baro_altitude_used;
+  out.clock_reference_source = fix.clock_reference_source;
   return out;
 }
+
+TrackManager::TrackManager(MlatMode mode) : mode_(mode) {}
 
 // Process a single L4 fix: apply 2-sensor quality gate, adaptive noise, create/update track.
 std::optional<TrackOutput> TrackManager::process_fix(const SolveFix& fix) {
@@ -573,6 +598,11 @@ std::optional<TrackOutput> TrackManager::solve_prediction_aided(const Group& gro
   solved_fix.squawk = group.squawk;
   solved_fix.raw_msg = group.raw_msg;
   solved_fix.t0_s = result->t0_s;
+  solved_fix.mlat_mode = mode_name(mode_);
+  solved_fix.position_source = "track_prediction_tdoa";
+  solved_fix.uses_track_prior = true;
+  solved_fix.baro_altitude_used = group.altitude_ft.has_value();
+  solved_fix.clock_reference_source = "inherited";
   --fixes_received;
   return process_fix(solved_fix);
 }
@@ -580,6 +610,9 @@ std::optional<TrackOutput> TrackManager::solve_prediction_aided(const Group& gro
 // Route incoming L4 record: solved fixes go to process_fix, unsolved groups to prediction-aided solver.
 std::optional<TrackOutput> TrackManager::process_record(const Layer4Record& record) {
   if (record.is_unsolved_group) {
+    if (mode_ == MlatMode::PureChallenge) {
+      return std::nullopt;
+    }
     ++fixes_received;
     auto result = solve_prediction_aided(record.unsolved_group);
     if (!result) {
@@ -638,7 +671,7 @@ int run_layer5(std::istream& in, std::ostream& out, std::ostream& log) {
   log << "Innovation gate: Chi-squared 3-DOF at 99.7% confidence\n";
   log << "Stats logged every 30s to stderr\n";
   log << "Stale track pruning every 60s\n";
-  TrackManager manager;
+  TrackManager manager(track_mode_from_env());
   int parse_errors = 0;
   double last_stats = monotonic_now();
   double last_prune = last_stats;

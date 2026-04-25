@@ -133,6 +133,12 @@ struct SolveFix {
   std::optional<std::string> squawk;
   std::string raw_msg;
   double t0_s = 0.0;                 // estimated emission time
+  std::string mlat_mode = "hybrid_ops";
+  std::string position_source = "hybrid_mlat";
+  bool uses_broadcast_position = false;
+  bool uses_track_prior = false;
+  bool baro_altitude_used = false;
+  std::string clock_reference_source = "none";
 };
 
 // Layer 4 output record: either a solved fix or an unsolved group passed through
@@ -166,6 +172,12 @@ struct TrackOutput {
   std::string raw_msg;
   double t0_s = 0.0;
   std::array<std::array<double, 2>, 2> cov_matrix{};  // 2x2 ENU position covariance
+  std::string mlat_mode = "hybrid_ops";
+  std::string position_source = "hybrid_mlat";
+  bool uses_broadcast_position = false;
+  bool uses_track_prior = false;
+  bool baro_altitude_used = false;
+  std::string clock_reference_source = "none";
 };
 
 // Lightweight JSON value (variant-based) for parsing JSONL input/output.
@@ -319,6 +331,37 @@ class SensorOverrideMap {
 std::optional<SensorOverrideMap> load_location_overrides();
 std::vector<Reception> apply_overrides(const std::vector<Reception>& receptions, SensorOverrideMap& override_map);
 
+enum class PositionSource {
+  PureMlat,
+  AdsbCpr,
+};
+
+enum class MlatMode {
+  HybridOps,
+  PureChallenge,
+};
+
+struct Layer4Config {
+  MlatMode mode = MlatMode::HybridOps;
+  int min_sensors_with_alt = 3;
+  int min_sensors_no_alt = 4;
+  bool allow_adsb_position_priors = true;
+  bool allow_adsb_clock_reference = true;
+  bool allow_2sensor_output = true;
+  bool allow_cached_altitude = true;
+  bool allow_adsb_velocity = true;
+};
+
+Layer4Config layer4_config_from_env();
+std::string mode_name(MlatMode mode);
+
+struct SolverConfig {
+  MlatMode mode = MlatMode::HybridOps;
+  int min_sensors_with_alt = 3;
+  int min_sensors_no_alt = 4;
+  bool allow_prior_aided = true;
+};
+
 // Per-ICAO cached position + velocity for prior-aided solving.
 struct CachedPosition {
   Vec3 ecef;
@@ -330,6 +373,7 @@ struct CachedPosition {
   double residual_m = 0.0;
   int solve_count = 1;
   double last_order = 0.0;
+  PositionSource source = PositionSource::PureMlat;
 
   Vec3 predict(double target_timestamp) const;  // linear extrapolation
   bool is_physically_consistent(const Vec3& new_ecef, double new_timestamp, double new_residual_m = 0.0) const;
@@ -339,7 +383,7 @@ struct CachedPosition {
 class PositionCache {
  public:
   std::optional<CachedPosition> get(const std::string& icao, std::optional<double> target_timestamp = std::nullopt);
-  void put(const std::string& icao, const Vec3& ecef, double lat, double lon, double alt_m, double timestamp, double residual_m = 0.0);
+  void put(const std::string& icao, const Vec3& ecef, double lat, double lon, double alt_m, double timestamp, double residual_m = 0.0, PositionSource source = PositionSource::PureMlat);
   void update_velocity_from_adsb(const std::string& icao, double ew_mps, double ns_mps, double vrate_mps, double timestamp);
   std::string stats_json() const;
   std::size_t size() const;
@@ -375,11 +419,11 @@ class ClockPairing {
   int consecutive_outliers = 0;
 };
 
-// Network clock calibrator: learns per-pair offsets from ADS-B reference positions,
+// Network clock calibrator: learns per-pair offsets from reference positions,
 // then corrects TOA timestamps using minimum-variance spanning tree.
 class ClockCalibrator {
  public:
-  void process_adsb_reference(const Vec3& aircraft_ecef, const std::vector<Reception>& receptions, double now);
+  void process_reference(const Vec3& aircraft_ecef, const std::vector<Reception>& receptions, double now, std::string_view source);
   std::vector<Reception> correct_timestamps(const std::vector<Reception>& receptions, double now);
   bool has_any_calibration(const std::vector<Reception>& receptions) const;
   std::string stats_json() const;
@@ -389,6 +433,8 @@ class ClockCalibrator {
   int sync_points_accepted = 0;
   int groups_corrected = 0;
   int calibrated_pairs = 0;
+  int adsb_reference_groups = 0;
+  int mlat_reference_groups = 0;
 
  private:
   ClockPairing& get_pairing(std::int64_t a, std::int64_t b);
@@ -436,7 +482,7 @@ struct SolveOutcome {
 };
 
 // Top-level solver: picks method based on sensor count, runs LM, validates result.
-SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position_prior_ecef, double prior_uncertainty_m = 500.0);
+SolveOutcome solve_group(const Group& group, const std::optional<Vec3>& position_prior_ecef, double prior_uncertainty_m = 500.0, const SolverConfig& config = SolverConfig{});
 
 // Aggregated statistics for Layer 4 solver performance.
 class Layer4Stats {
@@ -459,7 +505,7 @@ class Layer4Stats {
 // Main Layer 4 processing loop: reads JSONL groups, solves, writes fixes.
 class Layer4Processor {
  public:
-  Layer4Processor();
+  explicit Layer4Processor(Layer4Config config = layer4_config_from_env());
   bool process_line(const std::string& line, std::ostream& out, bool defer_no_prior = false);
   void process_deferred(std::ostream& out);
   void finish(std::ostream& log) const;
@@ -468,6 +514,7 @@ class Layer4Processor {
   void process_group(Group group, std::ostream& out, const std::string* defer_line = nullptr);
 
   Layer4Stats stats_;
+  Layer4Config config_;
   ClockCalibrator clock_cal_;
   PositionCache pos_cache_;
   CPRBuffer cpr_buffer_;
@@ -529,6 +576,7 @@ struct TrackState {
 // prunes stale tracks, and attempts prediction-aided solving for unsolved groups.
 class TrackManager {
  public:
+  explicit TrackManager(MlatMode mode = MlatMode::HybridOps);
   std::optional<TrackOutput> process_record(const Layer4Record& record);
   int prune_stale();             // remove tracks older than 300 s
   std::string stats_json() const;
@@ -538,6 +586,7 @@ class TrackManager {
   std::optional<TrackOutput> solve_prediction_aided(const Group& group);
   std::unordered_map<std::string, TrackState> tracks_;
   mutable double order_counter_ = 0.0;
+  MlatMode mode_ = MlatMode::HybridOps;
 
  public:
   int fixes_received = 0;
